@@ -21,8 +21,16 @@ from typing import Iterable
 
 import rclpy
 from control_msgs.msg import JointTrajectoryControllerState
-from moveit.core.robot_state import RobotState
-from moveit.planning import MoveItPy
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from moveit_msgs.msg import (
+    Constraints,
+    JointConstraint,
+    MotionPlanRequest,
+    MoveItErrorCodes,
+    PlanningOptions,
+    RobotTrajectory,
+)
+from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.utilities import remove_ros_args
@@ -190,6 +198,13 @@ class SysIdTelemetryPublisher(Node):
                 self._hold_reference = list(self._last_feedback[0])
             self._reference = None
 
+    def latest_feedback(self) -> tuple[list[float], list[float], list[float]] | None:
+        with self._lock:
+            if self._last_feedback is None:
+                return None
+            q, dq, effort = self._last_feedback
+            return list(q), list(dq), list(effort)
+
     def _extract_feedback(self, msg: JointState) -> tuple[list[float], list[float], list[float]] | None:
         index = {name: i for i, name in enumerate(msg.name)}
         missing = [joint for joint in self.joint_names if joint not in index]
@@ -353,48 +368,147 @@ joint_names:
     path.write_text(text, encoding="utf-8")
 
 
-def plan_to_joint_goal(moveit: MoveItPy, planning_component, group_name: str, q_goal: list[float]):
-    robot_model = moveit.get_robot_model()
-    goal_state = RobotState(robot_model)
-    goal_state.set_joint_group_positions(group_name, q_goal)
-    if hasattr(goal_state, "update"):
-        goal_state.update()
+class MoveItActionClient:
+    """Small blocking wrapper around MoveIt's standard planning/execution actions."""
 
-    planning_component.set_start_state_to_current_state()
-    planning_component.set_goal_state(robot_state=goal_state)
-    return planning_component.plan()
+    def __init__(
+        self,
+        node: Node,
+        *,
+        move_group_action: str,
+        execute_action: str,
+        group_name: str,
+        joint_names: list[str],
+        planner_id: str,
+        pipeline_id: str,
+        planning_attempts: int,
+        allowed_planning_time: float,
+        goal_tolerance: float,
+        velocity_scale: float,
+        acceleration_scale: float,
+    ):
+        self.node = node
+        self.group_name = group_name
+        self.joint_names = list(joint_names)
+        self.planner_id = planner_id
+        self.pipeline_id = pipeline_id
+        self.planning_attempts = planning_attempts
+        self.allowed_planning_time = allowed_planning_time
+        self.goal_tolerance = goal_tolerance
+        self.velocity_scale = velocity_scale
+        self.acceleration_scale = acceleration_scale
+        self.move_group = ActionClient(node, MoveGroup, move_group_action)
+        self.execute = ActionClient(node, ExecuteTrajectory, execute_action)
 
+    def wait_for_servers(self, timeout_sec: float) -> None:
+        if not self.move_group.wait_for_server(timeout_sec=timeout_sec):
+            raise RuntimeError("MoveGroup action server is not available")
+        if not self.execute.wait_for_server(timeout_sec=timeout_sec):
+            raise RuntimeError("ExecuteTrajectory action server is not available")
 
-def retime_trajectory(trajectory, velocity_scale: float, acceleration_scale: float, logger) -> None:
-    if hasattr(trajectory, "apply_ruckig_smoothing"):
-        if trajectory.apply_ruckig_smoothing(velocity_scale, acceleration_scale):
-            return
-        logger.warn("Ruckig smoothing failed; trying TOTG if available")
+    def _wait_future(self, future, timeout_sec: float, description: str):
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and not future.done():
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Timed out waiting for {description}")
+            time.sleep(0.02)
+        return future.result()
 
-    if hasattr(trajectory, "apply_totg_time_parameterization"):
-        if not trajectory.apply_totg_time_parameterization(velocity_scale, acceleration_scale):
-            logger.warn("TOTG time parameterization failed; using planner timing")
+    @staticmethod
+    def _error_code_ok(error_code) -> bool:
+        return int(getattr(error_code, "val", 0)) == int(MoveItErrorCodes.SUCCESS)
 
+    @staticmethod
+    def _error_code_value(error_code) -> int:
+        return int(getattr(error_code, "val", 0))
 
-def extract_joint_trajectory(trajectory) -> JointTrajectory:
-    if isinstance(trajectory, JointTrajectory):
-        return trajectory
+    def _build_request(
+        self,
+        q_goal: list[float],
+        current_feedback: tuple[list[float], list[float], list[float]] | None,
+    ) -> MotionPlanRequest:
+        request = MotionPlanRequest()
+        request.group_name = self.group_name
+        request.num_planning_attempts = int(self.planning_attempts)
+        request.allowed_planning_time = float(self.allowed_planning_time)
+        request.max_velocity_scaling_factor = float(self.velocity_scale)
+        request.max_acceleration_scaling_factor = float(self.acceleration_scale)
 
-    if hasattr(trajectory, "joint_trajectory"):
-        joint_traj = trajectory.joint_trajectory
-        if joint_traj.points:
-            return joint_traj
+        if self.planner_id:
+            request.planner_id = self.planner_id
+        if hasattr(request, "pipeline_id") and self.pipeline_id:
+            request.pipeline_id = self.pipeline_id
 
-    if hasattr(trajectory, "get_robot_trajectory_msg"):
-        try:
-            robot_traj_msg = trajectory.get_robot_trajectory_msg()
-        except TypeError:
-            robot_traj_msg = trajectory.get_robot_trajectory_msg(None)
-        joint_traj = robot_traj_msg.joint_trajectory
-        if joint_traj.points:
-            return joint_traj
+        if current_feedback is not None:
+            q, dq, _effort = current_feedback
+            request.start_state.joint_state.name = list(self.joint_names)
+            request.start_state.joint_state.position = list(q)
+            request.start_state.joint_state.velocity = list(dq)
+            request.start_state.is_diff = True
 
-    raise RuntimeError("Could not extract a trajectory_msgs/JointTrajectory from the MoveIt plan")
+        constraints = Constraints()
+        for joint_name, position in zip(self.joint_names, q_goal):
+            joint_constraint = JointConstraint()
+            joint_constraint.joint_name = joint_name
+            joint_constraint.position = float(position)
+            joint_constraint.tolerance_above = float(self.goal_tolerance)
+            joint_constraint.tolerance_below = float(self.goal_tolerance)
+            joint_constraint.weight = 1.0
+            constraints.joint_constraints.append(joint_constraint)
+        request.goal_constraints.append(constraints)
+        return request
+
+    def plan(
+        self,
+        q_goal: list[float],
+        current_feedback: tuple[list[float], list[float], list[float]] | None,
+        timeout_sec: float,
+    ) -> RobotTrajectory:
+        goal = MoveGroup.Goal()
+        goal.request = self._build_request(q_goal, current_feedback)
+        goal.planning_options = PlanningOptions()
+        goal.planning_options.plan_only = True
+        goal.planning_options.look_around = False
+        goal.planning_options.replan = False
+
+        send_future = self.move_group.send_goal_async(goal)
+        goal_handle = self._wait_future(send_future, timeout_sec, "MoveGroup goal acceptance")
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError("MoveGroup rejected the planning goal")
+
+        result_future = goal_handle.get_result_async()
+        result_response = self._wait_future(result_future, timeout_sec, "MoveGroup planning result")
+        result = result_response.result
+        if not self._error_code_ok(result.error_code):
+            raise RuntimeError(f"MoveGroup planning failed with error code {self._error_code_value(result.error_code)}")
+        if not result.planned_trajectory.joint_trajectory.points:
+            raise RuntimeError("MoveGroup returned an empty planned trajectory")
+        return result.planned_trajectory
+
+    def execute_trajectory(
+        self,
+        trajectory: RobotTrajectory,
+        *,
+        controllers: list[str],
+        timeout_sec: float,
+    ) -> None:
+        goal = ExecuteTrajectory.Goal()
+        goal.trajectory = trajectory
+        if hasattr(goal, "controller_names"):
+            goal.controller_names = list(controllers)
+
+        send_future = self.execute.send_goal_async(goal)
+        goal_handle = self._wait_future(send_future, timeout_sec, "ExecuteTrajectory goal acceptance")
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError("ExecuteTrajectory rejected the execution goal")
+
+        result_future = goal_handle.get_result_async()
+        result_response = self._wait_future(result_future, timeout_sec, "ExecuteTrajectory result")
+        result = result_response.result
+        if not self._error_code_ok(result.error_code):
+            raise RuntimeError(
+                f"ExecuteTrajectory failed with error code {self._error_code_value(result.error_code)}"
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -404,11 +518,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joints", nargs="+", default=FRANKA_JOINTS)
     parser.add_argument("--joint-states-topic", default="/joint_states")
     parser.add_argument("--telemetry-topic", default="/sysid/controller_state")
+    parser.add_argument("--move-group-action", default="/move_action")
+    parser.add_argument("--execute-action", default="/execute_trajectory")
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--storage", default="mcap")
     parser.add_argument("--no-record-bag", action="store_true")
     parser.add_argument("--record-topic", action="append", default=["/joint_states"])
     parser.add_argument("--controllers", nargs="*", default=[])
+    parser.add_argument("--planner-id", default="")
+    parser.add_argument("--pipeline-id", default="")
+    parser.add_argument("--planning-attempts", type=int, default=5)
+    parser.add_argument("--allowed-planning-time", type=float, default=5.0)
+    parser.add_argument("--goal-tolerance", type=float, default=0.01)
+    parser.add_argument("--action-server-timeout", type=float, default=10.0)
+    parser.add_argument("--planning-timeout", type=float, default=30.0)
+    parser.add_argument("--execution-timeout", type=float, default=60.0)
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--samples-per-cycle", type=int, default=6)
     parser.add_argument("--amplitude-scale", type=float, default=0.75)
@@ -434,6 +558,8 @@ def main() -> int:
         "joints": args.joints,
         "telemetry_topic": args.telemetry_topic,
         "joint_states_topic": args.joint_states_topic,
+        "move_group_action": args.move_group_action,
+        "execute_action": args.execute_action,
         "cycles": args.cycles,
         "samples_per_cycle": args.samples_per_cycle,
         "amplitude_scale": args.amplitude_scale,
@@ -460,8 +586,21 @@ def main() -> int:
         rclpy.shutdown()
         return 2
 
-    moveit = MoveItPy(node_name="franka_sysid_moveit")
-    arm = moveit.get_planning_component(args.group)
+    moveit = MoveItActionClient(
+        telemetry,
+        move_group_action=args.move_group_action,
+        execute_action=args.execute_action,
+        group_name=args.group,
+        joint_names=args.joints,
+        planner_id=args.planner_id,
+        pipeline_id=args.pipeline_id,
+        planning_attempts=args.planning_attempts,
+        allowed_planning_time=args.allowed_planning_time,
+        goal_tolerance=args.goal_tolerance,
+        velocity_scale=args.velocity_scale,
+        acceleration_scale=args.acceleration_scale,
+    )
+    moveit.wait_for_servers(args.action_server_timeout)
 
     waypoints = generate_excitation_waypoints(args.cycles, args.samples_per_cycle, args.amplitude_scale)
     logger.info(f"Generated {len(waypoints)} joint-space waypoints")
@@ -476,13 +615,8 @@ def main() -> int:
     try:
         for i, q_goal in enumerate(waypoints, start=1):
             logger.info(f"Planning segment {i}/{len(waypoints)}")
-            plan_result = plan_to_joint_goal(moveit, arm, args.group, q_goal)
-            if not plan_result:
-                raise RuntimeError(f"Planning failed for waypoint {i}: {q_goal}")
-
-            trajectory = plan_result.trajectory
-            retime_trajectory(trajectory, args.velocity_scale, args.acceleration_scale, logger)
-            joint_traj = extract_joint_trajectory(trajectory)
+            trajectory = moveit.plan(q_goal, telemetry.latest_feedback(), args.planning_timeout)
+            joint_traj = trajectory.joint_trajectory
             duration = duration_to_sec(joint_traj.points[-1].time_from_start)
             logger.info(f"Segment {i} duration: {duration:.3f} s")
 
@@ -491,7 +625,11 @@ def main() -> int:
 
             telemetry.set_trajectory(joint_traj)
             time.sleep(args.settle_sec)
-            moveit.execute(trajectory, controllers=args.controllers)
+            moveit.execute_trajectory(
+                trajectory,
+                controllers=args.controllers,
+                timeout_sec=max(args.execution_timeout, duration + args.execution_timeout),
+            )
             telemetry.hold_last_reference()
             time.sleep(args.segment_pause_sec)
 

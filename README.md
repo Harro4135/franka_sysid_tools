@@ -8,7 +8,7 @@ The package provides one executable:
 ros2 run franka_sysid_tools franka_sysid_collect --execute --output-dir ~/sysid_runs/franka_001
 ```
 
-It plans joint-space excitation motions with MoveIt 2, publishes an aligned `control_msgs/msg/JointTrajectoryControllerState` telemetry stream on `/sysid/controller_state`, records a ROS 2 bag, and writes a topic-map YAML that the Isaac SysID importer can load.
+It plans joint-space excitation motions through the standard MoveIt 2 `MoveGroup` action, executes the resulting trajectory through `ExecuteTrajectory`, publishes an aligned `control_msgs/msg/JointTrajectoryControllerState` telemetry stream on `/sysid/controller_state`, records a ROS 2 bag, and writes a topic-map YAML that the Isaac SysID importer can load.
 
 ## Layout
 
@@ -38,7 +38,7 @@ colcon build --packages-select franka_sysid_tools
 source install/setup.bash
 ```
 
-You need a working Franka MoveIt 2 setup first: robot bringup, controllers, `/joint_states`, and MoveIt planning/execution.
+You need a working Franka MoveIt 2 setup first: robot bringup, controllers, `/joint_states`, and MoveIt planning/execution. The script does not require `moveit_py`; it uses `moveit_msgs` actions so it works on Humble installs where `ros-humble-moveit-py` is unavailable.
 
 ## Dry Run
 
@@ -73,6 +73,10 @@ Load `bag/` as a ROS 2 bag in the Isaac SysID UI and set `Mapping config` to `fr
 --group panda_arm
 --joint-states-topic /joint_states
 --telemetry-topic /sysid/controller_state
+--move-group-action /move_action
+--execute-action /execute_trajectory
+--planner-id ''
+--pipeline-id ''
 --cycles 2
 --samples-per-cycle 6
 --amplitude-scale 0.75
