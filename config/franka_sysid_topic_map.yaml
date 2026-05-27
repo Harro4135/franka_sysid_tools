@@ -1,0 +1,39 @@
+time_topic: null
+time_field: header.stamp
+
+position_topic: /sysid/controller_state
+position_fields:
+  - feedback.positions
+  - actual.positions
+
+velocity_topic: /sysid/controller_state
+velocity_fields:
+  - feedback.velocities
+  - actual.velocities
+
+command_topic: /sysid/controller_state
+command_fields:
+  - reference.positions
+  - desired.positions
+
+torque_topic: null
+torque_fields:
+  - feedback.effort
+  - actual.effort
+
+end_effector_pose_topic: null
+end_effector_pose_fields:
+  - pose
+
+contact_force_topic: null
+contact_force_fields:
+  - wrench.force
+
+joint_names:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
