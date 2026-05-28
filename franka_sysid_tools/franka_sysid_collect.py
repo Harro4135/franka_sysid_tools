@@ -330,9 +330,8 @@ def write_topic_map(path: Path, telemetry_topic: str, joint_names: list[str], in
         f"torque_topic: {telemetry_topic}\n"
         "torque_fields:\n"
         "  - feedback.effort\n"
-        "  - actual.effort\n"
         if include_effort
-        else "torque_topic: null\ntorque_fields:\n  - feedback.effort\n  - actual.effort\n"
+        else "torque_topic: null\ntorque_fields:\n  - feedback.effort\n"
     )
     joints_yaml = "\n".join(f"  - {name}" for name in joint_names)
     text = f"""time_topic: null
@@ -341,17 +340,14 @@ time_field: header.stamp
 position_topic: {telemetry_topic}
 position_fields:
   - feedback.positions
-  - actual.positions
 
 velocity_topic: {telemetry_topic}
 velocity_fields:
   - feedback.velocities
-  - actual.velocities
 
 command_topic: {telemetry_topic}
 command_fields:
   - reference.positions
-  - desired.positions
 
 {torque_block}
 end_effector_pose_topic: null

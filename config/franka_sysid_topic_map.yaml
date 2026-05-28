@@ -4,22 +4,18 @@ time_field: header.stamp
 position_topic: /sysid/controller_state
 position_fields:
   - feedback.positions
-  - actual.positions
 
 velocity_topic: /sysid/controller_state
 velocity_fields:
   - feedback.velocities
-  - actual.velocities
 
 command_topic: /sysid/controller_state
 command_fields:
   - reference.positions
-  - desired.positions
 
 torque_topic: null
 torque_fields:
   - feedback.effort
-  - actual.effort
 
 end_effector_pose_topic: null
 end_effector_pose_fields:
