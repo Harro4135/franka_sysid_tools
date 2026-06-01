@@ -13,7 +13,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", ["config/franka_sysid_topic_map.yaml"]),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "numpy"],
     zip_safe=True,
     maintainer="Harro4135",
     maintainer_email="oliver.harrison@mail.utoronto.ca",
@@ -22,6 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "franka_sysid_collect = franka_sysid_tools.franka_sysid_collect:main",
+            "franka_sysid_collect_v2 = franka_sysid_tools.franka_sysid_collect_v2:main",
         ],
     },
 )

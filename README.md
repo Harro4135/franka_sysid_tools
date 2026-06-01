@@ -2,13 +2,21 @@
 
 ROS 2 helper package for collecting Franka/Panda free-space telemetry for Isaac Sim Robot Setup System Identification.
 
-The package provides one executable:
+The package provides two executables:
 
 ```bash
 ros2 run franka_sysid_tools franka_sysid_collect --execute --output-dir ~/sysid_runs/franka_001
 ```
 
 It plans joint-space excitation motions through the standard MoveIt 2 `MoveGroup` action, executes the resulting trajectory through `ExecuteTrajectory`, publishes an aligned `control_msgs/msg/JointTrajectoryControllerState` telemetry stream on `/sysid/controller_state`, records a ROS 2 bag, and writes a topic-map YAML that the Isaac SysID importer can load.
+
+For more methodical SysID data collection, use the v2 executable:
+
+```bash
+ros2 run franka_sysid_tools franka_sysid_collect_v2 --execute --output-dir ~/sysid_runs/franka_v2_001
+```
+
+V2 uses MoveIt only to reposition to the start of each phase, then commands explicit designed joint trajectories through a `FollowJointTrajectory` controller action. This makes the recorded `reference.positions` the actual designed excitation rather than a MoveIt-retimed waypoint path. The direct trajectories are generated inside a conservative free-space joint envelope; they are not Cartesian collision-checked point by point.
 
 ## Layout
 
@@ -21,6 +29,7 @@ franka_sysid_tools/
     franka_sysid_topic_map.yaml
   franka_sysid_tools/
     franka_sysid_collect.py
+    franka_sysid_collect_v2.py
 ```
 
 ## Build On The ROS Machine
@@ -67,6 +76,43 @@ Outputs:
 
 Load `bag/` as a ROS 2 bag in the Isaac SysID UI and set `Mapping config` to `franka_sysid_topic_map.yaml`.
 
+## Collect A Methodical V2 Dataset
+
+First find the joint trajectory controller action on the robot:
+
+```bash
+ros2 action list | grep follow_joint_trajectory
+```
+
+Then run v2 with that action path:
+
+```bash
+ros2 run franka_sysid_tools franka_sysid_collect_v2 \
+  --execute \
+  --follow-action /panda_arm_controller/follow_joint_trajectory \
+  --output-dir ~/sysid_runs/franka_v2_001
+```
+
+V2 writes:
+
+```text
+~/sysid_runs/franka_v2_001/
+  bag/
+  franka_sysid_topic_map.yaml
+  run_metadata.json
+  collection_manifest.json
+  phase_events.jsonl
+```
+
+The collection suite is split into phases:
+
+- `warmup_multisine`: low-amplitude controller/friction warmup.
+- `friction_sweeps_*`: single-joint sine sweeps at multiple peak velocities.
+- `coupled_multisine_train`: coupled multi-joint training excitation.
+- `coupled_multisine_fast`: lower-amplitude faster excitation for acceleration terms.
+- `static_holds`: steady poses for gravity/bias observations.
+- `coupled_multisine_validation`: held-out trajectory for validation, not fitting.
+
 ## Common Options
 
 ```bash
@@ -87,3 +133,17 @@ Load `bag/` as a ROS 2 bag in the Isaac SysID UI and set `Mapping config` to `fr
 ```
 
 Start conservatively on real hardware. Keep `--velocity-scale`, `--acceleration-scale`, and `--amplitude-scale` low until the trajectory is known to be safe for the cell.
+
+V2 safety knobs:
+
+```bash
+--sample-rate 50
+--base-period 8.0
+--amplitude-scale 0.70
+--friction-peak-velocity 0.12 0.28
+--max-joint-velocity 0.65
+--max-joint-acceleration 1.50
+--skip-moveit-start
+```
+
+Leave `--skip-moveit-start` off for normal use so MoveIt can reposition between phases. Only use it when the robot is already in the safe free-space envelope and the direct joint trajectory controller is known to be configured correctly.
