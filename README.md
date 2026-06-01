@@ -16,7 +16,7 @@ For more methodical SysID data collection, use the v2 executable:
 ros2 run franka_sysid_tools franka_sysid_collect_v2 --execute --output-dir ~/sysid_runs/franka_v2_001
 ```
 
-V2 uses MoveIt only to reposition to the start of each phase, then commands explicit designed joint trajectories through a `FollowJointTrajectory` controller action. This makes the recorded `reference.positions` the actual designed excitation rather than a MoveIt-retimed waypoint path. The direct trajectories are generated inside a conservative free-space joint envelope; they are not Cartesian collision-checked point by point.
+V2 uses MoveIt to reposition to the start of each phase, then commands explicit designed joint trajectories through a `FollowJointTrajectory` controller action. This makes the recorded `reference.positions` the actual designed excitation rather than a MoveIt-retimed waypoint path. Before execution, V2 samples the direct trajectory waypoints through MoveIt's `/check_state_validity` service so self/world collisions are caught before the robot moves.
 
 ## Layout
 
@@ -143,7 +143,11 @@ V2 safety knobs:
 --friction-peak-velocity 0.12 0.28
 --max-joint-velocity 0.65
 --max-joint-acceleration 1.50
+--collision-check-service /check_state_validity
+--collision-check-stride 10
 --skip-moveit-start
 ```
 
 Leave `--skip-moveit-start` off for normal use so MoveIt can reposition between phases. Only use it when the robot is already in the safe free-space envelope and the direct joint trajectory controller is known to be configured correctly.
+
+Collision checking is enabled for `--execute` runs by default. It checks every Nth generated waypoint, plus the final point, where N is `--collision-check-stride`. At the default `--sample-rate 50` and `--collision-check-stride 10`, that is one checked state about every 0.2 s. This is a sampled state-validity preflight, not a continuous swept-volume proof between samples. If your MoveIt setup exposes the state-validity service under a different name, pass `--collision-check-service`. If you intentionally need to bypass this preflight, pass `--no-collision-check`.

@@ -26,12 +26,14 @@ from pathlib import Path
 import numpy as np
 import rclpy
 from control_msgs.action import FollowJointTrajectory
-from moveit_msgs.msg import RobotTrajectory
+from moveit_msgs.msg import RobotState, RobotTrajectory
+from moveit_msgs.srv import GetStateValidity
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.utilities import remove_ros_args
+from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .franka_sysid_collect import (
@@ -111,6 +113,105 @@ class FollowTrajectoryClient:
         if error_code != successful_code:
             error_text = getattr(result, "error_string", "")
             raise RuntimeError(f"FollowJointTrajectory failed with code {error_code}: {error_text}")
+
+
+class MoveItStateValidityChecker:
+    """Waypoint collision checker using MoveIt's GetStateValidity service."""
+
+    def __init__(self, node: Node, service_name: str, group_name: str, joint_names: list[str]):
+        self.node = node
+        self.service_name = service_name
+        self.group_name = group_name
+        self.joint_names = list(joint_names)
+        self.client = node.create_client(GetStateValidity, service_name)
+
+    def wait_for_service(self, timeout_sec: float) -> None:
+        if not self.client.wait_for_service(timeout_sec=timeout_sec):
+            raise RuntimeError(
+                f"MoveIt state-validity service is not available: {self.service_name}. "
+                "Launch move_group with a planning scene monitor, or pass --no-collision-check."
+            )
+
+    def _wait_future(self, future, timeout_sec: float, description: str):
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and not future.done():
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Timed out waiting for {description}")
+            time.sleep(0.01)
+        return future.result()
+
+    def _request_for_positions(self, positions: list[float]) -> GetStateValidity.Request:
+        if len(positions) != len(self.joint_names):
+            raise ValueError(f"Expected {len(self.joint_names)} joint positions, got {len(positions)}")
+        joint_state = JointState()
+        joint_state.name = list(self.joint_names)
+        joint_state.position = [float(value) for value in positions]
+
+        robot_state = RobotState()
+        robot_state.joint_state = joint_state
+        robot_state.is_diff = True
+
+        request = GetStateValidity.Request()
+        request.robot_state = robot_state
+        request.group_name = self.group_name
+        return request
+
+    @staticmethod
+    def _format_contacts(response) -> str:
+        contacts = list(getattr(response, "contacts", []))
+        if not contacts:
+            return "no contact details returned"
+        pieces = []
+        for contact in contacts[:5]:
+            body_a = getattr(contact, "body_name_1", "?")
+            body_b = getattr(contact, "body_name_2", "?")
+            depth = getattr(contact, "depth", 0.0)
+            pieces.append(f"{body_a} <-> {body_b} depth={float(depth):.4g}")
+        suffix = "" if len(contacts) <= 5 else f", +{len(contacts) - 5} more"
+        return "; ".join(pieces) + suffix
+
+    def check_positions(self, positions: list[float], timeout_sec: float) -> tuple[bool, str]:
+        future = self.client.call_async(self._request_for_positions(positions))
+        response = self._wait_future(future, timeout_sec, "state-validity response")
+        if response is None:
+            raise RuntimeError("MoveIt state-validity service returned no response")
+        if bool(getattr(response, "valid", False)):
+            return True, ""
+        return False, self._format_contacts(response)
+
+    def check_trajectory(
+        self,
+        trajectory: JointTrajectory,
+        *,
+        phase_name: str,
+        stride: int,
+        timeout_sec: float,
+    ) -> int:
+        if list(trajectory.joint_names) != self.joint_names:
+            raise ValueError(
+                f"{phase_name}: trajectory joints {list(trajectory.joint_names)} do not match "
+                f"collision checker joints {self.joint_names}"
+            )
+        if not trajectory.points:
+            raise ValueError(f"{phase_name}: trajectory has no points to collision-check")
+
+        point_count = len(trajectory.points)
+        step = max(1, int(stride))
+        sample_indices = set(range(0, point_count, step))
+        sample_indices.add(point_count - 1)
+
+        checked = 0
+        for point_i in sorted(sample_indices):
+            point = trajectory.points[point_i]
+            valid, detail = self.check_positions(list(point.positions), timeout_sec)
+            checked += 1
+            if not valid:
+                t = duration_to_sec(point.time_from_start)
+                raise RuntimeError(
+                    f"{phase_name}: MoveIt collision check failed at point {point_i}/{point_count - 1} "
+                    f"(t={t:.3f}s): {detail}"
+                )
+        return checked
 
 
 def _msg_duration(seconds: float):
@@ -468,10 +569,17 @@ def write_manifest(path: Path, phases: list[ExcitationPhase], args: argparse.Nam
             "Reference commands are explicit FollowJointTrajectory samples, not MoveIt-retimed sine waypoints.",
             "Use train phases for fitting and validation phases for held-out error checks.",
             "All generated joint positions are clipped to conservative Franka limits.",
+            "When execution collision checking is enabled, direct trajectory waypoints are sampled through MoveIt GetStateValidity before motion starts.",
         ],
         "sample_rate_hz": args.sample_rate,
         "max_joint_velocity_rad_s": args.max_joint_velocity,
         "max_joint_acceleration_rad_s2": args.max_joint_acceleration,
+        "collision_check": {
+            "requested": not args.no_collision_check,
+            "service": args.collision_check_service,
+            "stride_points": args.collision_check_stride,
+            "timeout_sec": args.collision_check_timeout,
+        },
         "phases": [
             {
                 "name": phase.name,
@@ -519,6 +627,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--move-group-action", default="/move_action")
     parser.add_argument("--execute-action", default="/execute_trajectory")
     parser.add_argument("--skip-moveit-start", action="store_true")
+    parser.add_argument("--no-collision-check", action="store_true")
+    parser.add_argument("--collision-check-service", default="/check_state_validity")
+    parser.add_argument("--collision-check-stride", type=int, default=10)
+    parser.add_argument("--collision-check-timeout", type=float, default=5.0)
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--storage", default="mcap")
     parser.add_argument("--no-record-bag", action="store_true")
@@ -609,8 +721,17 @@ def main() -> int:
 
     follow_client = FollowTrajectoryClient(telemetry, args.follow_action)
     moveit = None
+    collision_checker = None
     if args.execute:
         follow_client.wait_for_server(args.action_server_timeout)
+        if not args.no_collision_check:
+            collision_checker = MoveItStateValidityChecker(
+                telemetry,
+                args.collision_check_service,
+                args.group,
+                args.joints,
+            )
+            collision_checker.wait_for_service(args.action_server_timeout)
         if not args.skip_moveit_start:
             moveit = MoveItActionClient(
                 telemetry,
@@ -627,6 +748,23 @@ def main() -> int:
                 acceleration_scale=min(args.max_joint_acceleration, 0.25),
             )
             moveit.wait_for_servers(args.action_server_timeout)
+
+    if collision_checker is not None:
+        logger.info(
+            f"Preflight collision checking direct phase trajectories via {args.collision_check_service} "
+            f"(stride={args.collision_check_stride})"
+        )
+        total_checked = 0
+        for phase in phases:
+            checked = collision_checker.check_trajectory(
+                phase.trajectory,
+                phase_name=phase.name,
+                stride=args.collision_check_stride,
+                timeout_sec=args.collision_check_timeout,
+            )
+            total_checked += checked
+            logger.info(f"Collision check passed for {phase.name}: {checked} sampled states")
+        logger.info(f"Collision preflight passed for all direct phases: {total_checked} sampled states")
 
     recorder = None
     if args.execute and not args.no_record_bag:
