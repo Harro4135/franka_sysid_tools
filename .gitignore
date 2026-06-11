@@ -16,3 +16,9 @@ metadata.yaml
 
 .vscode/
 .idea/
+tmp_sysid_plots/joint_collection_overview.png
+.gitignore
+tmp_sysid_plots/joint_torque.png
+tmp_sysid_plots/joint_position.png
+tmp_sysid_plots/joint_velocity.png
+franka_sysid_tools/so101_sysid_collect_v2.py
