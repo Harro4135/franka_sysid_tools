@@ -382,12 +382,12 @@ def _make_multisine_phase(
     sample_count = max(3, int(round(duration * sample_rate)) + 1)
     times = np.linspace(0.0, duration, sample_count)
     positions = _multisine_positions(times, base_period=base_period, amplitude_scale=amplitude_scale, variant=variant)
-    trajectory = _build_trajectory_with_derivatives(
+    trajectory = _build_trajectory(
         joint_names,
         times,
         positions,
-        velocities,
-        accelerations,
+        max_velocity=max_velocity,
+        max_acceleration=max_acceleration,
     )
     return ExcitationPhase(name, split, purpose, trajectory, hold_after_sec=hold_after_sec)
 
@@ -758,12 +758,12 @@ def _solve_d_optimal_phase(
         condition_penalty=condition_penalty,
     )
 
-    trajectory = _build_trajectory(
+    trajectory = _build_trajectory_with_derivatives(
         joint_names,
         times,
         positions,
-        max_velocity=max_velocity,
-        max_acceleration=max_acceleration,
+        velocities,
+        accelerations,
     )
     phase = ExcitationPhase(name, split, purpose, trajectory, hold_after_sec=hold_after_sec)
     phase.d_optimal_score = score
