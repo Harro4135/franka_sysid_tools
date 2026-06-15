@@ -84,27 +84,29 @@ def _fourier_unroll_numpy(
 def _fourier_unroll_symbolic(times: np.ndarray, q0, a, b, base_period: float):
     ca = _import_casadi()
     omega = 2.0 * math.pi / float(base_period)
-    q_rows = []
-    dq_rows = []
-    ddq_rows = []
     harmonic_count = int(a.shape[1])
-    for time_value in times:
-        q_t = q0
-        dq_t = 0.0 * q0
-        ddq_t = 0.0 * q0
-        for harmonic_i in range(harmonic_count):
-            harmonic = float(harmonic_i + 1)
-            wt = omega * harmonic * float(time_value)
-            denom = omega * harmonic
-            a_col = a[:, harmonic_i]
-            b_col = b[:, harmonic_i]
-            q_t = q_t + (a_col / denom) * math.sin(wt) - (b_col / denom) * math.cos(wt)
-            dq_t = dq_t + a_col * math.cos(wt) + b_col * math.sin(wt)
-            ddq_t = ddq_t - (a_col * denom) * math.sin(wt) + (b_col * denom) * math.cos(wt)
-        q_rows.append(q_t.T)
-        dq_rows.append(dq_t.T)
-        ddq_rows.append(ddq_t.T)
-    return ca.vertcat(*q_rows), ca.vertcat(*dq_rows), ca.vertcat(*ddq_rows)
+    num_times = len(times)
+    
+    # Precompute time-harmonic grids using NumPy (Shape: N x H)
+    harmonics = np.arange(1, harmonic_count + 1, dtype=np.float64).reshape(1, -1)
+    wt = omega * (times.reshape(-1, 1) @ harmonics)
+    sin_wt = np.sin(wt)
+    cos_wt = np.cos(wt)
+    
+    # Broadcast denominators over CasADi terms
+    denom = omega * harmonics  # (1 x H)
+    A_q = a / denom
+    B_q = b / denom
+    
+    # Fully vectorized trajectory expression evaluations (Shape: N x J)
+    q_grid = ca.repmat(q0.T, num_times, 1) + ca.mtimes(sin_wt, A_q.T) - ca.mtimes(cos_wt, B_q.T)
+    dq_grid = ca.mtimes(cos_wt, a.T) + ca.mtimes(sin_wt, b.T)
+    
+    A_ddq = a * denom
+    B_ddq = b * denom
+    ddq_grid = -ca.mtimes(sin_wt, A_ddq.T) + ca.mtimes(cos_wt, B_ddq.T)
+    
+    return q_grid, dq_grid, ddq_grid
 
 
 def _physical_logdet_callback(
@@ -125,7 +127,8 @@ def _physical_logdet_callback(
             ca.Callback.__init__(self)
             variable_count = joint_count * (1 + 2 * harmonic_count)
             self._input_sparsity = ca.Sparsity.dense(variable_count, 1)
-            self.construct(name, {"enable_fd": True})
+            # Tuned finite differences for optimized numerical objective evaluations
+            self.construct(name, {"enable_fd": True, "fd_method": "forward", "fd_step": 1e-6})
 
         def get_n_in(self):
             return 1
@@ -176,18 +179,20 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
     b = opti.variable(joint_count, args.fourier_harmonics)
     x = ca.vertcat(q0, ca.reshape(a, -1, 1), ca.reshape(b, -1, 1))
 
+    # Fast symbolic expression generation
     q_grid, dq_grid, ddq_grid = _fourier_unroll_symbolic(times, q0, a, b, args.base_period)
+    
     min_q = np.asarray([limit[0] for limit in FRANKA_LIMITS], dtype=np.float64)
     max_q = np.asarray([limit[1] for limit in FRANKA_LIMITS], dtype=np.float64)
-    for joint_i in range(joint_count):
-        opti.subject_to(opti.bounded(min_q[joint_i], q_grid[:, joint_i], max_q[joint_i]))
-        opti.subject_to(opti.bounded(-args.max_joint_velocity, dq_grid[:, joint_i], args.max_joint_velocity))
-        opti.subject_to(opti.bounded(-args.max_joint_acceleration, ddq_grid[:, joint_i], args.max_joint_acceleration))
+    
+    # Vectorized bounds constraints across the entire grid
+    opti.subject_to(opti.bounded(min_q.reshape(1, -1), q_grid, max_q.reshape(1, -1)))
+    opti.subject_to(opti.bounded(-args.max_joint_velocity, dq_grid, args.max_joint_velocity))
+    opti.subject_to(opti.bounded(-args.max_joint_acceleration, ddq_grid, args.max_joint_acceleration))
+    
+    # Boundary constraints at t=0 (End boundaries are implicitly satisfied via Fourier periodicity)
     opti.subject_to(dq_grid[0, :] == 0.0)
-    opti.subject_to(dq_grid[-1, :] == 0.0)
     opti.subject_to(ddq_grid[0, :] == 0.0)
-    opti.subject_to(ddq_grid[-1, :] == 0.0)
-    opti.subject_to(q_grid[0, :] == q_grid[-1, :])
 
     callback = _physical_logdet_callback(
         name="offline_physical_logdet",
@@ -206,6 +211,7 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
     coeff_scale = max(0.01, float(args.amplitude_scale)) * np.asarray(FRANKA_AMPLITUDES)[:, np.newaxis]
     initial_a = rng.normal(0.0, 0.05, size=(joint_count, args.fourier_harmonics)) * coeff_scale
     initial_b = rng.normal(0.0, 0.05, size=(joint_count, args.fourier_harmonics)) * coeff_scale
+    
     initial_a -= np.mean(initial_a, axis=1, keepdims=True)
     weighted = np.arange(1, args.fourier_harmonics + 1, dtype=np.float64)[np.newaxis, :]
     initial_b -= np.sum(weighted * initial_b, axis=1, keepdims=True) / np.sum(weighted)
@@ -223,6 +229,7 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
     )
     solution = opti.solve()
     x_value = np.asarray(solution.value(x), dtype=np.float64).reshape(-1)
+    
     q, dq, ddq = _fourier_unroll_numpy(
         x_value,
         times,
