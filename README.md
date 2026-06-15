@@ -162,6 +162,66 @@ The v3 suite is split into:
 
 The manifest records the URDF path, base-regressor rank settings, Fourier harmonics, IPOPT settings, ridge/condition penalty, and per-phase D-optimal scores. The URDF must be a fixed-base Panda model matching the seven controlled arm joints.
 
+## Offline V3 Solve And Sim Replay
+
+You can solve the physical-regressor D-optimal trajectory on a non-ROS machine with only Python, NumPy, CasADi, Pinocchio, and Matplotlib:
+
+```bash
+python -m franka_sysid_tools.franka_sysid_optimize_v3_offline \
+  --urdf-path /path/to/panda_fixed_base.urdf \
+  --output-dir ~/sysid_runs/franka_v3_offline_plan
+```
+
+The offline package writes:
+
+```text
+~/sysid_runs/franka_v3_offline_plan/
+  trajectory.json
+  trajectory.csv
+  trajectory.npz
+  manifest.json
+  positions.png
+  velocities.png
+  accelerations.png
+  torque_preview.png
+```
+
+The plots and `torque_preview` are a Pinocchio inverse-dynamics preview, useful for checking the shape and effort scale before running through ROS. To replay the offline trajectory in MoveIt fake hardware or another ROS sim, start MoveIt with `use_real_hardware:=false`, then run:
+
+```bash
+ros2 run franka_sysid_tools franka_sysid_collect_v3 \
+  --execute \
+  --trajectory-json ~/sysid_runs/franka_v3_offline_plan/trajectory.json \
+  --follow-action /panda_arm_controller/follow_joint_trajectory \
+  --output-dir ~/sysid_runs/franka_v3_fake_hw_replay
+```
+
+When `--trajectory-json` is supplied, the ROS collector skips CasADi/Pinocchio optimization and uses the sampled offline trajectory directly. Collision preflight, MoveIt start repositioning, telemetry publishing, and bag recording still run through the normal v3 execution path.
+
+You can also replay the same offline trajectory in MuJoCo without ROS:
+
+```bash
+python -m franka_sysid_tools.franka_sysid_sim_mujoco \
+  --model-path /path/to/panda_mujoco.xml \
+  --trajectory-json ~/sysid_runs/franka_v3_offline_plan/trajectory.json \
+  --use-feedforward \
+  --output-dir ~/sysid_runs/franka_v3_mujoco_replay
+```
+
+The MuJoCo replay script applies a joint-space PD controller plus optional feedforward torques from the offline Pinocchio preview. By default it writes directly to `qfrc_applied`, which is useful for model-level testing even if the MJCF has no actuators. Use `--control-mode actuator` when your MJCF has torque actuators attached to the Panda joints.
+
+MuJoCo replay writes:
+
+```text
+~/sysid_runs/franka_v3_mujoco_replay/
+  mujoco_replay.csv
+  mujoco_replay.npz
+  mujoco_manifest.json
+  position_tracking.png
+  position_error.png
+  commanded_torque.png
+```
+
 ## Collect An SO-101 V2 Dataset
 
 First find the SO-101 joint trajectory controller action:
@@ -221,6 +281,7 @@ V3 D-optimality knobs:
 
 ```bash
 --urdf-path /path/to/panda_fixed_base.urdf
+--trajectory-json ~/sysid_runs/franka_v3_offline_plan/trajectory.json
 --base-regressor-samples 240
 --base-regressor-rank-tolerance 1e-8
 --fourier-harmonics 5

@@ -68,6 +68,19 @@ class BaseRegressorModel:
     def base_regressor(self, q: np.ndarray, dq: np.ndarray, ddq: np.ndarray) -> np.ndarray:
         return self.full_regressor(q, dq, ddq)[:, self.base_columns]
 
+    def inverse_dynamics(self, q: np.ndarray, dq: np.ndarray, ddq: np.ndarray) -> np.ndarray:
+        pin = _import_pinocchio()
+        return np.asarray(
+            pin.rnea(
+                self.model,
+                self.data,
+                np.asarray(q, dtype=np.float64),
+                np.asarray(dq, dtype=np.float64),
+                np.asarray(ddq, dtype=np.float64),
+            ),
+            dtype=np.float64,
+        )
+
     def stacked_base_regressor(self, q: np.ndarray, dq: np.ndarray, ddq: np.ndarray) -> np.ndarray:
         rows = [self.base_regressor(q_i, dq_i, ddq_i) for q_i, dq_i, ddq_i in zip(q, dq, ddq)]
         return np.vstack(rows)
