@@ -119,6 +119,8 @@ def _physical_logdet_callback(
     base_period: float,
     ridge: float,
     condition_penalty: float,
+    objective: str,
+    include_friction: bool,
 ):
     ca = _import_casadi()
 
@@ -151,12 +153,14 @@ def _physical_logdet_callback(
                 harmonic_count=harmonic_count,
                 base_period=base_period,
             )
-            score = regressor_model.logdet_information(
+            score = regressor_model.objective_score(
                 q,
                 dq,
                 ddq,
                 ridge=ridge,
                 condition_penalty=condition_penalty,
+                objective=objective,
+                include_friction=include_friction,
             )
             return [np.asarray([[score]], dtype=np.float64)]
 
@@ -203,6 +207,8 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
         base_period=args.base_period,
         ridge=args.ridge,
         condition_penalty=args.condition_penalty,
+        objective=args.objective,
+        include_friction=args.include_friction_regressor,
     )
     opti.minimize(-callback(x))
 
@@ -244,14 +250,69 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
         harmonic_count=args.fourier_harmonics,
         base_period=args.base_period,
     )
-    score = regressor_model.logdet_information(
+    score = regressor_model.objective_score(
         score_q,
         score_dq,
         score_ddq,
         ridge=args.ridge,
         condition_penalty=args.condition_penalty,
+        objective=args.objective,
+        include_friction=args.include_friction_regressor,
     )
-    return times, q, dq, ddq, x_value, score
+    return times, q, dq, ddq, x_value, score, times[score_indices]
+
+
+def _diagnostics_payload(
+    regressor_model: BaseRegressorModel,
+    q: np.ndarray,
+    dq: np.ndarray,
+    ddq: np.ndarray,
+    *,
+    rank_tolerance: float,
+    ridge: float,
+) -> dict:
+    return {
+        "inertial_only": {
+            "full": regressor_model.trajectory_diagnostics(
+                q,
+                dq,
+                ddq,
+                rank_tolerance=rank_tolerance,
+                ridge=ridge,
+                include_friction=False,
+                base_only=False,
+            ).to_dict(),
+            "base": regressor_model.trajectory_diagnostics(
+                q,
+                dq,
+                ddq,
+                rank_tolerance=rank_tolerance,
+                ridge=ridge,
+                include_friction=False,
+                base_only=True,
+            ).to_dict(),
+        },
+        "inertial_plus_friction": {
+            "full": regressor_model.trajectory_diagnostics(
+                q,
+                dq,
+                ddq,
+                rank_tolerance=rank_tolerance,
+                ridge=ridge,
+                include_friction=True,
+                base_only=False,
+            ).to_dict(),
+            "base": regressor_model.trajectory_diagnostics(
+                q,
+                dq,
+                ddq,
+                rank_tolerance=rank_tolerance,
+                ridge=ridge,
+                include_friction=True,
+                base_only=True,
+            ).to_dict(),
+        },
+    }
 
 
 def write_outputs(
@@ -264,6 +325,7 @@ def write_outputs(
     ddq: np.ndarray,
     coefficients: np.ndarray,
     score: float,
+    score_times: np.ndarray,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     tau = np.vstack([regressor_model.inverse_dynamics(q_i, dq_i, ddq_i) for q_i, dq_i, ddq_i in zip(q, dq, ddq)])
@@ -312,15 +374,48 @@ def write_outputs(
 
     min_q = np.asarray([limit[0] for limit in FRANKA_LIMITS], dtype=np.float64)
     max_q = np.asarray([limit[1] for limit in FRANKA_LIMITS], dtype=np.float64)
+    score_q, score_dq, score_ddq = _fourier_unroll_numpy(
+        coefficients,
+        score_times,
+        joint_count=len(FRANKA_JOINTS),
+        harmonic_count=args.fourier_harmonics,
+        base_period=args.base_period,
+    )
+    score_grid_diagnostics = _diagnostics_payload(
+        regressor_model,
+        score_q,
+        score_dq,
+        score_ddq,
+        rank_tolerance=args.base_regressor_rank_tolerance,
+        ridge=args.ridge,
+    )
+    full_trajectory_diagnostics = _diagnostics_payload(
+        regressor_model,
+        q,
+        dq,
+        ddq,
+        rank_tolerance=args.base_regressor_rank_tolerance,
+        ridge=args.ridge,
+    )
     manifest = {
         "schema": "franka_sysid_offline_d_optimal_run_v1",
         "created_wall_time": time.time(),
         "urdf_path": str(Path(args.urdf_path).expanduser().resolve()),
         "joint_names": FRANKA_JOINTS,
         "d_optimal_score": float(score),
+        "objective": args.objective,
         "base_regressor_rank": regressor_model.structural_rank,
         "full_parameter_count": regressor_model.full_parameter_count,
         "base_columns": regressor_model.base_columns.tolist(),
+        "rejected_columns": [] if regressor_model.rejected_columns is None else regressor_model.rejected_columns.tolist(),
+        "structural_sampling": regressor_model.structural_sampling,
+        "structural_diagnostics": (
+            None
+            if regressor_model.structural_diagnostics is None
+            else regressor_model.structural_diagnostics.to_dict()
+        ),
+        "score_grid_diagnostics": score_grid_diagnostics,
+        "full_trajectory_diagnostics": full_trajectory_diagnostics,
         "limits": {
             "position_min": min_q.tolist(),
             "position_max": max_q.tolist(),
@@ -339,6 +434,9 @@ def write_outputs(
             "score_stride": args.score_stride,
             "ridge": args.ridge,
             "condition_penalty": args.condition_penalty,
+            "objective": args.objective,
+            "include_friction_regressor": args.include_friction_regressor,
+            "base_regressor_sampling": args.base_regressor_sampling,
             "ipopt_max_iter": args.ipopt_max_iter,
             "ipopt_tolerance": args.ipopt_tolerance,
         },
@@ -390,7 +488,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260611)
     parser.add_argument("--score-stride", type=int, default=4)
     parser.add_argument("--ridge", type=float, default=1e-3)
-    parser.add_argument("--condition-penalty", type=float, default=0.0)
+    parser.add_argument("--condition-penalty", type=float, default=0.05)
+    parser.add_argument(
+        "--objective",
+        choices=["d_opt", "conditioned_d_opt", "e_opt", "condition"],
+        default="conditioned_d_opt",
+    )
+    parser.add_argument(
+        "--base-regressor-sampling",
+        choices=["random_feasible", "trajectory"],
+        default="random_feasible",
+    )
+    parser.set_defaults(include_friction_regressor=True)
+    parser.add_argument(
+        "--include-friction-regressor",
+        dest="include_friction_regressor",
+        action="store_true",
+        help="Include Coulomb and viscous friction columns in optimizer scoring and diagnostics.",
+    )
+    parser.add_argument(
+        "--disable-friction-regressor",
+        dest="include_friction_regressor",
+        action="store_false",
+        help="Score only inertial base-regressor columns.",
+    )
     parser.add_argument("--max-joint-velocity", type=float, default=0.65)
     parser.add_argument("--max-joint-acceleration", type=float, default=1.50)
     parser.add_argument("--base-regressor-samples", type=int, default=240)
@@ -421,14 +542,44 @@ def main() -> int:
         base_period=args.base_period,
         structural_samples=args.base_regressor_samples,
         rank_tolerance=args.base_regressor_rank_tolerance,
+        structural_sampling=args.base_regressor_sampling,
+        seed=args.seed,
+        joint_limits=FRANKA_LIMITS,
+        max_joint_velocity=args.max_joint_velocity,
+        max_joint_acceleration=args.max_joint_acceleration,
     )
-    times, q, dq, ddq, coefficients, score = solve_offline(args, regressor_model)
-    write_outputs(output_dir, args, regressor_model, times, q, dq, ddq, coefficients, score)
+    times, q, dq, ddq, coefficients, score, score_times = solve_offline(args, regressor_model)
+    write_outputs(output_dir, args, regressor_model, times, q, dq, ddq, coefficients, score, score_times)
     print(f"Wrote offline trajectory package: {output_dir}")
-    print(f"D-optimal score: {score:.6g}")
+    print(f"Objective score ({args.objective}): {score:.6g}")
+    full_diag = regressor_model.trajectory_diagnostics(
+        q,
+        dq,
+        ddq,
+        rank_tolerance=args.base_regressor_rank_tolerance,
+        ridge=args.ridge,
+        include_friction=args.include_friction_regressor,
+        base_only=False,
+    )
+    base_diag = regressor_model.trajectory_diagnostics(
+        q,
+        dq,
+        ddq,
+        rank_tolerance=args.base_regressor_rank_tolerance,
+        ridge=args.ridge,
+        include_friction=args.include_friction_regressor,
+        base_only=True,
+    )
     print(
         f"Base regressor rank: {regressor_model.structural_rank}/"
         f"{regressor_model.full_parameter_count}"
+    )
+    print(
+        "Trajectory diagnostics: "
+        f"full_rank={full_diag.rank}/{full_diag.column_count}, "
+        f"base_rank={base_diag.rank}/{base_diag.column_count}, "
+        f"condition={base_diag.condition_number:.6g}, "
+        f"min_sv={base_diag.min_singular_value:.6g}"
     )
     return 0
 

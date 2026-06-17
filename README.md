@@ -172,6 +172,12 @@ python -m franka_sysid_tools.franka_sysid_optimize_v3_offline \
   --output-dir ~/sysid_runs/franka_v3_offline_plan
 ```
 
+By default the offline optimizer uses seeded random feasible samples to select
+base-regressor columns, includes Coulomb/viscous friction columns in the
+trajectory scoring objective, and solves a conditioned D-optimal problem. Use
+`--objective d_opt` and `--disable-friction-regressor` for the original
+inertial-only D-optimal style.
+
 The offline package writes:
 
 ```text
@@ -292,6 +298,16 @@ V3 D-optimality knobs:
 --ipopt-max-iter 500
 --ipopt-print-level 5
 --ipopt-tolerance 1e-6
+```
+
+Offline-only rank-aware optimizer knobs:
+
+```bash
+--base-regressor-sampling random_feasible
+--objective conditioned_d_opt
+--condition-penalty 0.05
+--include-friction-regressor
+--disable-friction-regressor
 ```
 
 Leave `--skip-moveit-start` off for normal use so MoveIt can reposition between phases. Only use it when the robot is already in the safe free-space envelope and the direct joint trajectory controller is known to be configured correctly.
