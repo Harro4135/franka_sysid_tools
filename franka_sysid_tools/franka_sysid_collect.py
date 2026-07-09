@@ -156,13 +156,40 @@ class TrajectoryReference:
 
 
 class SysIdTelemetryPublisher(Node):
-    """Publishes measured state and planned reference on one aligned topic."""
+    """Publishes measured state and planned reference on one aligned topic.
 
-    def __init__(self, joint_names: list[str], joint_states_topic: str, telemetry_topic: str):
+    ``torque_source`` selects what lands in ``feedback.effort``:
+
+    - ``joint_states`` (default): pass ``JointState.effort`` through verbatim.
+      Its meaning is whatever the driver stack's publisher decided — measured
+      on franka_v2_003 to be gravity-free with per-joint offsets, i.e. NOT the
+      link-side torque the SysID presolve assumes — so the topic map declares
+      it ``torque_semantics: external`` (excluded from torque-domain fitting).
+    - ``franka_robot_state``: take ``tau_J`` (measured link-side joint torque
+      sensors, gravity-inclusive) from the franka_robot_state_broadcaster and
+      publish it as ``feedback.effort``, aligned by latest-value hold on the
+      ``/joint_states`` clock. Unambiguous ``torque_semantics: link_side``.
+    """
+
+    TORQUE_SOURCE_JOINT_STATES = "joint_states"
+    TORQUE_SOURCE_FRANKA_ROBOT_STATE = "franka_robot_state"
+    _ROBOT_STATE_STALE_SEC = 0.5
+
+    def __init__(
+        self,
+        joint_names: list[str],
+        joint_states_topic: str,
+        telemetry_topic: str,
+        *,
+        torque_source: str = TORQUE_SOURCE_JOINT_STATES,
+        robot_state_topic: str = "/franka_robot_state_broadcaster/robot_state",
+    ):
         super().__init__("franka_sysid_telemetry_publisher")
         self.joint_names = list(joint_names)
         self.joint_states_topic = joint_states_topic
         self.telemetry_topic = telemetry_topic
+        self.torque_source = torque_source
+        self.robot_state_topic = robot_state_topic
         self.pub = self.create_publisher(JointTrajectoryControllerState, telemetry_topic, 10)
         self.sub = self.create_subscription(JointState, joint_states_topic, self._on_joint_state, 50)
 
@@ -174,6 +201,82 @@ class SysIdTelemetryPublisher(Node):
         self._hold_reference: list[float] | None = None
         self._last_feedback: tuple[list[float], list[float], list[float]] | None = None
         self._last_warn_time = 0.0
+
+        self._tau_j: list[float] | None = None
+        self._tau_j_monotonic = 0.0
+        self._tau_j_field_logged = False
+        self._robot_state_sub = None
+        if torque_source == self.TORQUE_SOURCE_FRANKA_ROBOT_STATE:
+            try:
+                from franka_msgs.msg import FrankaRobotState
+            except ImportError as exc:
+                raise RuntimeError(
+                    "torque_source='franka_robot_state' requires franka_msgs (franka_ros2). "
+                    "Install it, or launch the franka_robot_state_broadcaster stack, or use "
+                    "torque_source='joint_states'."
+                ) from exc
+            self._robot_state_sub = self.create_subscription(
+                FrankaRobotState, robot_state_topic, self._on_robot_state, 10
+            )
+        elif torque_source != self.TORQUE_SOURCE_JOINT_STATES:
+            raise ValueError(f"Unknown torque_source: {torque_source!r}")
+
+    def _extract_tau_j(self, msg) -> tuple[list[float] | None, str]:
+        """Pull per-joint tau_J out of a FrankaRobotState, tolerating message-version drift."""
+        measured = getattr(msg, "measured_joint_state", None)
+        if measured is not None:
+            efforts = list(getattr(measured, "effort", []) or [])
+            names = list(getattr(measured, "name", []) or [])
+            if efforts:
+                if names and all(joint in names for joint in self.joint_names):
+                    index = {name: i for i, name in enumerate(names)}
+                    return [float(efforts[index[joint]]) for joint in self.joint_names], "measured_joint_state.effort"
+                if len(efforts) >= len(self.joint_names):
+                    return [float(v) for v in efforts[: len(self.joint_names)]], "measured_joint_state.effort"
+        for attr in ("tau_j", "tau_J"):
+            values = getattr(msg, attr, None)
+            if values is not None and len(values) >= len(self.joint_names):
+                return [float(v) for v in list(values)[: len(self.joint_names)]], attr
+        return None, ""
+
+    def _on_robot_state(self, msg) -> None:
+        tau_j, field = self._extract_tau_j(msg)
+        if tau_j is None:
+            now = time.monotonic()
+            if now - self._last_warn_time > 2.0:
+                self.get_logger().warn(
+                    f"{self.robot_state_topic}: could not extract tau_J "
+                    "(no measured_joint_state.effort / tau_j field); feedback.effort falls back to "
+                    f"{self.joint_states_topic} effort."
+                )
+                self._last_warn_time = now
+            return
+        if not self._tau_j_field_logged:
+            self.get_logger().info(f"torque source: {self.robot_state_topic} field '{field}' (tau_J, link-side)")
+            self._tau_j_field_logged = True
+        with self._lock:
+            self._tau_j = tau_j
+            self._tau_j_monotonic = time.monotonic()
+
+    def _effort_for_feedback(self, joint_states_effort: list[float]) -> list[float]:
+        if self.torque_source != self.TORQUE_SOURCE_FRANKA_ROBOT_STATE:
+            return joint_states_effort
+        with self._lock:
+            tau_j = self._tau_j
+            age = time.monotonic() - self._tau_j_monotonic
+        now = time.monotonic()
+        if tau_j is None:
+            if now - self._last_warn_time > 2.0:
+                self.get_logger().warn(
+                    f"No FrankaRobotState received on {self.robot_state_topic} yet; "
+                    f"feedback.effort using {self.joint_states_topic} effort (NOT link-side)."
+                )
+                self._last_warn_time = now
+            return joint_states_effort
+        if age > self._ROBOT_STATE_STALE_SEC and now - self._last_warn_time > 2.0:
+            self.get_logger().warn(f"tau_J from {self.robot_state_topic} is stale ({age:.2f}s old).")
+            self._last_warn_time = now
+        return tau_j
 
     def wait_for_joint_state(self, timeout_sec: float) -> bool:
         return self._have_state.wait(timeout=timeout_sec)
@@ -265,7 +368,7 @@ class SysIdTelemetryPublisher(Node):
         out.joint_names = list(self.joint_names)
 
         reference_point = make_point(reference.positions, reference.velocities)
-        feedback_point = make_point(q, dq, effort)
+        feedback_point = make_point(q, dq, self._effort_for_feedback(effort))
         error_point = make_point(err_q, err_dq)
 
         self._set_state_field(out, "reference", reference_point)
@@ -325,11 +428,27 @@ def generate_excitation_waypoints(cycles: int, samples_per_cycle: int, amplitude
     return waypoints
 
 
-def write_topic_map(path: Path, telemetry_topic: str, joint_names: list[str], include_effort: bool) -> None:
+def write_topic_map(
+    path: Path,
+    telemetry_topic: str,
+    joint_names: list[str],
+    include_effort: bool,
+    torque_semantics: str = "external",
+) -> None:
+    """Write the Isaac SysID topic mapping.
+
+    ``torque_semantics`` declares what ``feedback.effort`` measures, explicitly —
+    the SysID extension defaults a missing key to ``link_side`` (gravity-inclusive
+    transmitted torque), which is wrong for a passthrough of ``JointState.effort``
+    on a gravity-compensated stack (measured on franka_v2_003: gravity absent,
+    per-joint offsets present). Pass ``link_side`` only for a verified source such
+    as tau_J from the franka_robot_state_broadcaster.
+    """
     torque_block = (
         f"torque_topic: {telemetry_topic}\n"
         "torque_fields:\n"
         "  - feedback.effort\n"
+        f"torque_semantics: {torque_semantics}\n"
         if include_effort
         else "torque_topic: null\ntorque_fields:\n  - feedback.effort\n"
     )

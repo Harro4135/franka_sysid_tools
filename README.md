@@ -2,6 +2,8 @@
 
 ROS 2 helper package for collecting Franka/Panda free-space telemetry for Isaac Sim Robot Setup System Identification.
 
+For a full guided Stage-2 capture (offline D-optimal plan, preflight with a logging-rate gate, v3 + v2 friction/static suites with link-side torque, post-capture QC), see [`STAGE2_SESSION.md`](STAGE2_SESSION.md) and run [`scripts/stage2_capture_session.sh`](scripts/stage2_capture_session.sh). Both v2 and v3 collectors accept `--torque-source franka-robot-state` to publish measured link-side `tau_J` as `feedback.effort` (declared `torque_semantics: link_side` in the topic map) and to record the raw robot-state topic.
+
 The package provides several collection executables:
 
 ```bash

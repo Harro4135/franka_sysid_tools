@@ -1002,6 +1002,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joints", nargs="+", default=FRANKA_JOINTS)
     parser.add_argument("--joint-states-topic", default="/joint_states")
     parser.add_argument("--telemetry-topic", default="/sysid/controller_state")
+    parser.add_argument(
+        "--torque-source",
+        choices=("joint-states", "franka-robot-state"),
+        default="joint-states",
+        help="What feedback.effort measures. 'joint-states' passes JointState.effort through "
+        "(stack-dependent meaning; declared torque_semantics: external). 'franka-robot-state' "
+        "takes tau_J (measured link-side torque) from the franka_robot_state_broadcaster and "
+        "declares torque_semantics: link_side; the raw robot-state topic is also recorded.",
+    )
+    parser.add_argument(
+        "--robot-state-topic",
+        default="/franka_robot_state_broadcaster/robot_state",
+        help="FrankaRobotState topic used when --torque-source franka-robot-state.",
+    )
     parser.add_argument("--follow-action", default="/panda_arm_controller/follow_joint_trajectory")
     parser.add_argument("--move-group-action", default="/move_action")
     parser.add_argument("--execute-action", default="/execute_trajectory")
@@ -1078,7 +1092,15 @@ def main() -> int:
     topic_map_path = output_dir / "franka_sysid_topic_map.yaml"
     manifest_path = output_dir / "collection_manifest.json"
     phase_events_path = output_dir / "phase_events.jsonl"
-    write_topic_map(topic_map_path, args.telemetry_topic, args.joints, args.include_effort)
+    use_franka_robot_state = args.torque_source == "franka-robot-state"
+    torque_semantics = "link_side" if use_franka_robot_state else "external"
+    write_topic_map(
+        topic_map_path,
+        args.telemetry_topic,
+        args.joints,
+        args.include_effort,
+        torque_semantics=torque_semantics,
+    )
     write_manifest(manifest_path, phases, args)
 
     metadata = {
@@ -1087,6 +1109,9 @@ def main() -> int:
         "joints": args.joints,
         "telemetry_topic": args.telemetry_topic,
         "joint_states_topic": args.joint_states_topic,
+        "torque_source": args.torque_source,
+        "torque_semantics": torque_semantics,
+        "robot_state_topic": args.robot_state_topic if use_franka_robot_state else "",
         "follow_action": args.follow_action,
         "move_group_action": args.move_group_action,
         "execute_action": args.execute_action,
@@ -1099,7 +1124,13 @@ def main() -> int:
     (output_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     rclpy.init(args=sys.argv)
-    telemetry = SysIdTelemetryPublisher(args.joints, args.joint_states_topic, args.telemetry_topic)
+    telemetry = SysIdTelemetryPublisher(
+        args.joints,
+        args.joint_states_topic,
+        args.telemetry_topic,
+        torque_source=args.torque_source.replace("-", "_"),
+        robot_state_topic=args.robot_state_topic,
+    )
     executor = MultiThreadedExecutor()
     executor.add_node(telemetry)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -1166,7 +1197,8 @@ def main() -> int:
 
     recorder = None
     if args.execute and not args.no_record_bag:
-        topics = unique_ordered([args.telemetry_topic, *args.record_topic])
+        extra_topics = [args.robot_state_topic] if use_franka_robot_state else []
+        topics = unique_ordered([args.telemetry_topic, *args.record_topic, *extra_topics])
         recorder = BagRecorder(output_dir / "bag", topics, args.storage)
         logger.info(f"Starting bag recorder for topics: {topics}")
         recorder.start()
