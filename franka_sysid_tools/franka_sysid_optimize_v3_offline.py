@@ -233,9 +233,20 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
             "print_time": False,
         },
     )
-    solution = opti.solve()
-    x_value = np.asarray(solution.value(x), dtype=np.float64).reshape(-1)
-    
+    # Opti.solve() raises when IPOPT stops on the iteration cap. With small
+    # --ipopt-max-iter budgets that is the expected exit: take the last iterate
+    # (the hard limit check below rejects it if it is not yet feasible).
+    try:
+        solution = opti.solve()
+        x_value = np.asarray(solution.value(x), dtype=np.float64).reshape(-1)
+        ipopt_status = str(solution.stats().get("return_status", "unknown"))
+    except RuntimeError as exc:
+        ipopt_status = str(opti.debug.stats().get("return_status", "")) or f"exception: {exc}"
+        if "Maximum_Iterations_Exceeded" not in ipopt_status:
+            raise
+        x_value = np.asarray(opti.debug.value(x), dtype=np.float64).reshape(-1)
+        print(f"IPOPT stopped on the iteration cap ({args.ipopt_max_iter}); using the last iterate.")
+
     q, dq, ddq = _fourier_unroll_numpy(
         x_value,
         times,
@@ -243,6 +254,23 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
         harmonic_count=args.fourier_harmonics,
         base_period=args.base_period,
     )
+    # Hard feasibility gate: an early-stopped interior-point iterate may sit
+    # outside the constraint set, and this trajectory goes to hardware. Reject
+    # instead of clipping (clipping would distort the D-optimal content).
+    slack = 1e-6
+    violations = []
+    if np.any(q < min_q.reshape(1, -1) - slack) or np.any(q > max_q.reshape(1, -1) + slack):
+        violations.append("joint position limits")
+    if np.any(np.abs(dq) > args.max_joint_velocity + slack):
+        violations.append(f"velocity limit {args.max_joint_velocity}")
+    if np.any(np.abs(ddq) > args.max_joint_acceleration + slack):
+        violations.append(f"acceleration limit {args.max_joint_acceleration}")
+    if violations:
+        raise SystemExit(
+            f"Unconverged design (IPOPT status: {ipopt_status}) violates: {', '.join(violations)}. "
+            "Raise --ipopt-max-iter and re-run; do not execute this trajectory."
+        )
+
     score_q, score_dq, score_ddq = _fourier_unroll_numpy(
         x_value,
         times[score_indices],
@@ -439,6 +467,7 @@ def write_outputs(
             "base_regressor_sampling": args.base_regressor_sampling,
             "ipopt_max_iter": args.ipopt_max_iter,
             "ipopt_tolerance": args.ipopt_tolerance,
+            "ipopt_return_status": ipopt_status,
         },
         "files": {
             "npz": "trajectory.npz",
@@ -516,7 +545,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-joint-acceleration", type=float, default=1.50)
     parser.add_argument("--base-regressor-samples", type=int, default=240)
     parser.add_argument("--base-regressor-rank-tolerance", type=float, default=1e-8)
-    parser.add_argument("--ipopt-max-iter", type=int, default=500)
+    parser.add_argument("--ipopt-max-iter", type=int, default=10)
     parser.add_argument("--ipopt-print-level", type=int, default=5)
     parser.add_argument("--ipopt-tolerance", type=float, default=1e-6)
     parser.add_argument("--no-plots", action="store_true")
