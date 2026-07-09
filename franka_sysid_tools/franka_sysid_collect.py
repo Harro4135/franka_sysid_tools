@@ -207,16 +207,27 @@ class SysIdTelemetryPublisher(Node):
         self._tau_j_field_logged = False
         self._robot_state_sub = None
         if torque_source == self.TORQUE_SOURCE_FRANKA_ROBOT_STATE:
-            try:
-                from franka_msgs.msg import FrankaRobotState
-            except ImportError as exc:
+            # The robot-state message name drifted across franka_ros2 versions:
+            # newer stacks publish FrankaRobotState, older ones FrankaState (with
+            # a flat tau_J array — _extract_tau_j handles both layouts).
+            robot_state_type = None
+            import_errors = []
+            for type_name in ("FrankaRobotState", "FrankaState"):
+                try:
+                    module = __import__("franka_msgs.msg", fromlist=[type_name])
+                    robot_state_type = getattr(module, type_name)
+                    break
+                except (ImportError, AttributeError) as exc:
+                    import_errors.append(f"{type_name}: {exc}")
+            if robot_state_type is None:
                 raise RuntimeError(
-                    "torque_source='franka_robot_state' requires franka_msgs (franka_ros2). "
-                    "Install it, or launch the franka_robot_state_broadcaster stack, or use "
-                    "torque_source='joint_states'."
-                ) from exc
+                    "torque_source='franka_robot_state' requires franka_msgs with a "
+                    "FrankaRobotState or FrankaState message (franka_ros2). Install/source it, "
+                    "or use torque_source='joint_states'. Import attempts: " + "; ".join(import_errors)
+                )
+            self.get_logger().info(f"robot-state message type: franka_msgs/msg/{robot_state_type.__name__}")
             self._robot_state_sub = self.create_subscription(
-                FrankaRobotState, robot_state_topic, self._on_robot_state, 10
+                robot_state_type, robot_state_topic, self._on_robot_state, 10
             )
         elif torque_source != self.TORQUE_SOURCE_JOINT_STATES:
             raise ValueError(f"Unknown torque_source: {torque_source!r}")

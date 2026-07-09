@@ -45,8 +45,11 @@ if ! ros2 topic list 2>/dev/null | grep -q "^$ROBOT_STATE_TOPIC$"; then
   [ "$EXECUTE" = "1" ] && exit 2
 fi
 
-RATE=$(timeout 15 ros2 topic hz --window 200 "$JOINT_STATES_TOPIC" 2>/dev/null \
-        | grep -oE "average rate: [0-9.]+" | tail -1 | grep -oE "[0-9.]+" || echo 0)
+# timeout(1) exits 124 when it kills `ros2 topic hz`; neutralize it before the
+# pipe so pipefail doesn't both fail the parse and append the `|| echo 0`
+# fallback onto an already-captured rate.
+RATE=$( { timeout 15 ros2 topic hz --window 200 "$JOINT_STATES_TOPIC" 2>/dev/null || true; } \
+        | grep -oE "average rate: [0-9.]+" | tail -n1 | grep -oE "[0-9.]+" || echo 0)
 echo "   $JOINT_STATES_TOPIC measured rate: ${RATE:-0} Hz (floor $MIN_RATE_HZ, target >= $TARGET_RATE_HZ)"
 python3 - "$RATE" "$MIN_RATE_HZ" "$TARGET_RATE_HZ" <<'EOF'
 import sys

@@ -15,6 +15,9 @@
   <depend>control_msgs</depend>
   <depend>moveit_msgs</depend>
 
+  <!-- Imported at runtime when --torque-source franka-robot-state subscribes to
+       FrankaRobotState for link-side tau_J. -->
+  <exec_depend>franka_msgs</exec_depend>
   <exec_depend>ros2bag</exec_depend>
   <exec_depend>rosbag2_storage_mcap</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
