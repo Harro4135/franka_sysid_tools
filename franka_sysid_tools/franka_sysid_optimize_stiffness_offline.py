@@ -36,7 +36,10 @@ FRANKA_JOINTS = [
 ]
 
 FRANKA_CENTER = np.asarray([0.0, -0.75, 0.0, -2.20, 0.0, 1.75, 0.80], dtype=np.float64)
-FRANKA_AMPLITUDES = np.asarray([0.35, 0.25, 0.35, 0.22, 0.35, 0.22, 0.35], dtype=np.float64)
+# Nominal per-joint excursion allowances.  The base receives the largest
+# increase; the other joints are raised modestly while retaining extra margin
+# on the elbow/wrist joints whose centers sit closer to their useful envelope.
+FRANKA_AMPLITUDES = np.asarray([0.40, 0.28, 0.38, 0.25, 0.38, 0.25, 0.38], dtype=np.float64)
 FRANKA_LIMITS = np.asarray(
     [
         (-2.70, 2.70),
@@ -602,7 +605,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--constraint-rate", type=float, default=500.0)
     parser.add_argument("--amplitude-scale", type=float, default=0.90)
     parser.add_argument("--max-joint-velocity", type=float, default=0.85)
-    parser.add_argument("--max-joint-acceleration", type=float, default=1.75)
+    parser.add_argument("--max-joint-acceleration", type=float, default=2.0)
     parser.add_argument(
         "--max-joint-jerk",
         type=float,

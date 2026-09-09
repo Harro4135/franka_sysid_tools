@@ -4,11 +4,19 @@ import numpy as np
 
 from franka_sysid_tools.franka_sysid_optimize_stiffness_offline import (
     DesignConfig,
+    FRANKA_AMPLITUDES,
     FRANKA_LIMITS,
+    build_argument_parser,
     design_trajectory,
     stiffness_sensitivity_gain_squared,
     write_outputs,
 )
+
+
+def test_production_defaults_use_boosted_motion_envelope():
+    np.testing.assert_allclose(FRANKA_AMPLITUDES, [0.40, 0.28, 0.38, 0.25, 0.38, 0.25, 0.38])
+    args = build_argument_parser().parse_args(["--output-dir", "unused"])
+    assert args.max_joint_acceleration == 2.0
 
 
 def _config(**overrides):
