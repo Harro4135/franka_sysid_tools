@@ -287,7 +287,7 @@ def solve_offline(args: argparse.Namespace, regressor_model: BaseRegressorModel)
         objective=args.objective,
         include_friction=args.include_friction_regressor,
     )
-    return times, q, dq, ddq, x_value, score, times[score_indices]
+    return times, q, dq, ddq, x_value, score, times[score_indices], ipopt_status
 
 
 def _diagnostics_payload(
@@ -354,6 +354,7 @@ def write_outputs(
     coefficients: np.ndarray,
     score: float,
     score_times: np.ndarray,
+    ipopt_status: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     tau = np.vstack([regressor_model.inverse_dynamics(q_i, dq_i, ddq_i) for q_i, dq_i, ddq_i in zip(q, dq, ddq)])
@@ -427,6 +428,7 @@ def write_outputs(
     )
     manifest = {
         "schema": "franka_sysid_offline_d_optimal_run_v1",
+        "status": "success",
         "created_wall_time": time.time(),
         "urdf_path": str(Path(args.urdf_path).expanduser().resolve()),
         "joint_names": FRANKA_JOINTS,
@@ -577,8 +579,20 @@ def main() -> int:
         max_joint_velocity=args.max_joint_velocity,
         max_joint_acceleration=args.max_joint_acceleration,
     )
-    times, q, dq, ddq, coefficients, score, score_times = solve_offline(args, regressor_model)
-    write_outputs(output_dir, args, regressor_model, times, q, dq, ddq, coefficients, score, score_times)
+    times, q, dq, ddq, coefficients, score, score_times, ipopt_status = solve_offline(args, regressor_model)
+    write_outputs(
+        output_dir,
+        args,
+        regressor_model,
+        times,
+        q,
+        dq,
+        ddq,
+        coefficients,
+        score,
+        score_times,
+        ipopt_status,
+    )
     print(f"Wrote offline trajectory package: {output_dir}")
     print(f"Objective score ({args.objective}): {score:.6g}")
     full_diag = regressor_model.trajectory_diagnostics(

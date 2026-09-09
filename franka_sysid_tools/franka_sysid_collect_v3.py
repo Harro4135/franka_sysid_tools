@@ -774,9 +774,26 @@ def _solve_d_optimal_phase(
     return phase
 
 
-def _make_phase_from_offline_json(path: str | Path, joint_names: list[str]) -> ExcitationPhase:
+def _make_phase_from_offline_json(
+    path: str | Path,
+    joint_names: list[str],
+    *,
+    name: str = "d_optimal_train",
+    split: str = "train",
+    purpose: str = "Offline generated physical-regressor D-optimal training trajectory.",
+) -> ExcitationPhase:
     source = Path(path).expanduser().resolve()
     payload = json.loads(source.read_text(encoding="utf-8"))
+    if payload.get("design") == "position_domain_stiffness_sensitivity_v1":
+        if name == "d_optimal_train":
+            name = "stiffness_train"
+            purpose = "Offline optimized position-domain drive-stiffness sensitivity training trajectory."
+        elif name == "d_optimal_validation":
+            name = "stiffness_validation"
+            purpose = (
+                "Independent position-domain drive-stiffness validation trajectory; "
+                "exclude this phase from fitting."
+            )
     source_joints = list(payload.get("joint_names", []))
     if source_joints != list(joint_names):
         raise ValueError(f"{source}: joint_names {source_joints} do not match expected {joint_names}")
@@ -795,17 +812,124 @@ def _make_phase_from_offline_json(path: str | Path, joint_names: list[str]) -> E
         trajectory.points.append(point)
 
     return ExcitationPhase(
-        "offline_d_optimal_trajectory",
-        "train",
-        f"Offline generated physical-regressor D-optimal trajectory loaded from {source}.",
+        name,
+        split,
+        f"{purpose.rstrip('.')} Loaded from {source}.",
         trajectory,
         hold_after_sec=0.0,
     )
 
 
+def _trajectories_equal(left: JointTrajectory, right: JointTrajectory) -> bool:
+    """Return whether two imported trajectories contain the same numeric samples."""
+    if list(left.joint_names) != list(right.joint_names) or len(left.points) != len(right.points):
+        return False
+    for left_point, right_point in zip(left.points, right.points):
+        if not math.isclose(
+            duration_to_sec(left_point.time_from_start),
+            duration_to_sec(right_point.time_from_start),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return False
+        for field in ("positions", "velocities", "accelerations"):
+            if not np.array_equal(
+                np.asarray(getattr(left_point, field), dtype=np.float64),
+                np.asarray(getattr(right_point, field), dtype=np.float64),
+            ):
+                return False
+    return True
+
+
+def _validate_imported_trajectory(
+    trajectory: JointTrajectory,
+    source: str | Path,
+    *,
+    max_velocity: float,
+    max_acceleration: float,
+) -> None:
+    """Validate imported samples against the collector's active hardware envelope."""
+    source_path = Path(source).expanduser().resolve()
+    joint_count = len(trajectory.joint_names)
+    previous_time = -math.inf
+    tolerance = 1e-5
+    for point_i, point in enumerate(trajectory.points):
+        arrays = {
+            field: np.asarray(getattr(point, field), dtype=np.float64)
+            for field in ("positions", "velocities", "accelerations")
+        }
+        for field, values in arrays.items():
+            if values.shape != (joint_count,):
+                raise ValueError(
+                    f"{source_path}: point {point_i} {field} has shape {values.shape}; "
+                    f"expected ({joint_count},)"
+                )
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{source_path}: point {point_i} {field} contains a non-finite value")
+        timestamp = duration_to_sec(point.time_from_start)
+        if not math.isfinite(timestamp) or timestamp <= previous_time:
+            raise ValueError(f"{source_path}: point {point_i} time must be finite and strictly increasing")
+        previous_time = timestamp
+        for joint_i, (value, (lower, upper)) in enumerate(zip(arrays["positions"], FRANKA_LIMITS)):
+            if value < lower - tolerance or value > upper + tolerance:
+                raise ValueError(
+                    f"{source_path}: point {point_i} joint {trajectory.joint_names[joint_i]} position "
+                    f"{value:.6g} is outside [{lower:.6g}, {upper:.6g}]"
+                )
+        velocity_peak = float(np.max(np.abs(arrays["velocities"])))
+        acceleration_peak = float(np.max(np.abs(arrays["accelerations"])))
+        if velocity_peak > max_velocity + tolerance:
+            raise ValueError(
+                f"{source_path}: point {point_i} velocity {velocity_peak:.6g} exceeds "
+                f"--max-joint-velocity {max_velocity:.6g}"
+            )
+        if acceleration_peak > max_acceleration + tolerance:
+            raise ValueError(
+                f"{source_path}: point {point_i} acceleration {acceleration_peak:.6g} exceeds "
+                f"--max-joint-acceleration {max_acceleration:.6g}"
+            )
+
+
 def build_excitation_suite(args: argparse.Namespace) -> list[ExcitationPhase]:
     if args.trajectory_json:
-        return [_make_phase_from_offline_json(args.trajectory_json, args.joints)]
+        train = _make_phase_from_offline_json(
+            args.trajectory_json,
+            args.joints,
+            name="d_optimal_train",
+            split="train",
+            purpose="Offline generated physical-regressor D-optimal training trajectory.",
+        )
+        _validate_imported_trajectory(
+            train.trajectory,
+            args.trajectory_json,
+            max_velocity=args.max_joint_velocity,
+            max_acceleration=args.max_joint_acceleration,
+        )
+        phases = [train]
+        if args.validation_trajectory_json:
+            validation = _make_phase_from_offline_json(
+                args.validation_trajectory_json,
+                args.joints,
+                name="d_optimal_validation",
+                split="validation",
+                purpose=(
+                    "Independent offline generated physical-regressor D-optimal validation trajectory; "
+                    "exclude this phase from fitting"
+                ),
+            )
+            _validate_imported_trajectory(
+                validation.trajectory,
+                args.validation_trajectory_json,
+                max_velocity=args.max_joint_velocity,
+                max_acceleration=args.max_joint_acceleration,
+            )
+            if _trajectories_equal(train.trajectory, validation.trajectory):
+                raise ValueError(
+                    "Training and validation trajectory files contain identical samples. "
+                    "Generate validation with a different seed and trajectory settings."
+                )
+            phases.append(validation)
+        return phases
 
     regressor_model = load_base_regressor_model(
         urdf_path=args.urdf_path,
@@ -920,26 +1044,50 @@ def build_excitation_suite(args: argparse.Namespace) -> list[ExcitationPhase]:
 
 
 def write_manifest(path: Path, phases: list[ExcitationPhase], args: argparse.Namespace) -> None:
-    manifest = {
-        "schema": "franka_sysid_collection_v3",
-        "description": "D-optimal joint-space SysID suite with train and held-out validation phases.",
-        "notes": [
+    stiffness_only = any(phase.name.startswith("stiffness_") for phase in phases)
+    if stiffness_only:
+        description = "Position-domain drive-stiffness excitation with train and held-out validation phases."
+        notes = [
+            "Reference commands are explicit FollowJointTrajectory samples, not MoveIt-retimed sine waypoints.",
+            "Fit stiffness from reference/feedback position response; torque is diagnostic only.",
+            "Use stiffness_train for fitting and stiffness_validation only for held-out error checks.",
+            "The imported Fourier trajectories have dense q/dq/ddq verification and zero boundary velocity/acceleration.",
+            "MoveIt GetStateValidity is still a sampled-state preflight, not a continuous swept-volume proof.",
+        ]
+        design_name = "position_domain_stiffness_sensitivity_fourier"
+    else:
+        description = "D-optimal joint-space SysID suite with train and held-out validation phases."
+        notes = [
             "Reference commands are explicit FollowJointTrajectory samples, not MoveIt-retimed sine waypoints.",
             "Use train phases for fitting and validation phases for held-out error checks.",
             "Coupled excitation phases are finite-Fourier-series NLP solutions with hard sampled q/dq/ddq bounds.",
             "D-optimality is computed against identifiable base columns of Pinocchio's physical torque regressor.",
-            "When execution collision checking is enabled, direct trajectory waypoints are sampled through MoveIt GetStateValidity before motion starts.",
-        ],
+            "When enabled, trajectory waypoints are sampled through MoveIt GetStateValidity before motion.",
+        ]
+        design_name = "physical_base_regressor_d_optimal_fourier_nlp"
+    manifest = {
+        "schema": "franka_sysid_collection_v3",
+        "description": description,
+        "design": design_name,
+        "notes": notes,
         "sample_rate_hz": args.sample_rate,
         "max_joint_velocity_rad_s": args.max_joint_velocity,
         "max_joint_acceleration_rad_s2": args.max_joint_acceleration,
         "trajectory_json": args.trajectory_json,
+        "validation_trajectory_json": args.validation_trajectory_json,
         "urdf_path": args.urdf_path,
+        "holdout": {
+            "required": bool(args.require_validation),
+            "present": any(phase.split == "validation" for phase in phases),
+            "policy": "validation phases are excluded from fitting and used only for held-out metrics",
+        },
         "base_regressor": {
+            "used": not stiffness_only,
             "structural_samples": args.base_regressor_samples,
             "rank_tolerance": args.base_regressor_rank_tolerance,
         },
         "d_optimality": {
+            "used": not stiffness_only,
             "seed": args.d_opt_seed,
             "fourier_harmonics": args.fourier_harmonics,
             "score_stride": args.d_opt_score_stride,
@@ -958,6 +1106,8 @@ def write_manifest(path: Path, phases: list[ExcitationPhase], args: argparse.Nam
             {
                 "name": phase.name,
                 "split": phase.split,
+                "fit_eligible": phase.split == "train",
+                "excluded_from_fit": phase.split != "train",
                 "purpose": phase.purpose,
                 "duration_sec": phase.duration,
                 "points": len(phase.trajectory.points),
@@ -981,6 +1131,8 @@ def append_phase_event(path: Path, node: Node, phase: ExcitationPhase, event: st
         "event": event,
         "phase": phase.name,
         "split": phase.split,
+        "fit_eligible": phase.split == "train",
+        "excluded_from_fit": phase.split != "train",
         "ros_time_sec": float(now.sec) + 1e-9 * float(now.nanosec),
         "wall_time": time.time(),
         "monotonic_time": time.monotonic(),
@@ -1043,7 +1195,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-cycles", type=int, default=4)
     parser.add_argument("--validation-cycles", type=int, default=2)
     parser.add_argument("--amplitude-scale", type=float, default=0.70)
-    parser.add_argument("--trajectory-json", default="", help="Replay a trajectory.json generated by franka_sysid_optimize_v3_offline.")
+    parser.add_argument(
+        "--trajectory-json",
+        default="",
+        help="Replay a training trajectory.json generated by franka_sysid_optimize_v3_offline.",
+    )
+    parser.add_argument(
+        "--validation-trajectory-json",
+        default="",
+        help=(
+            "Replay a separately optimized trajectory.json as d_optimal_validation. "
+            "It is tagged validation and excluded from fitting."
+        ),
+    )
+    parser.add_argument(
+        "--require-validation",
+        action="store_true",
+        help="Refuse to run unless the suite contains an independent validation phase.",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run collision checks for every phase without recording or commanding robot motion.",
+    )
     parser.add_argument("--urdf-path", default="", help="Fixed-base Panda URDF used by Pinocchio for torque regressors.")
     parser.add_argument("--base-regressor-samples", type=int, default=240)
     parser.add_argument("--base-regressor-rank-tolerance", type=float, default=1e-8)
@@ -1067,6 +1241,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.execute and args.preflight_only:
+        print("--execute and --preflight-only are mutually exclusive.", file=sys.stderr)
+        return 2
+    if args.preflight_only and args.no_collision_check:
+        print("--preflight-only requires collision checking; remove --no-collision-check.", file=sys.stderr)
+        return 2
+    if args.validation_trajectory_json and not args.trajectory_json:
+        print("--validation-trajectory-json requires --trajectory-json.", file=sys.stderr)
+        return 2
+    if args.require_validation and args.trajectory_json and not args.validation_trajectory_json:
+        print(
+            "--require-validation with an offline plan requires --validation-trajectory-json.",
+            file=sys.stderr,
+        )
+        return 2
     if list(args.joints) != FRANKA_JOINTS:
         print(
             "franka_sysid_collect_v3 currently expects the full Panda arm joint list in the default order. "
@@ -1089,6 +1278,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     phases = build_excitation_suite(args)
+    stiffness_only = any(phase.name.startswith("stiffness_") for phase in phases)
     topic_map_path = output_dir / "franka_sysid_topic_map.yaml"
     manifest_path = output_dir / "collection_manifest.json"
     phase_events_path = output_dir / "phase_events.jsonl"
@@ -1118,8 +1308,15 @@ def main() -> int:
         "topic_map": str(topic_map_path),
         "manifest": str(manifest_path),
         "phase_events": str(phase_events_path),
-        "design": "physical_base_regressor_d_optimal_fourier_nlp_with_moveit_start_repositioning",
+        "design": (
+            "position_domain_stiffness_sensitivity_fourier_with_moveit_start_repositioning"
+            if stiffness_only
+            else "physical_base_regressor_d_optimal_fourier_nlp_with_moveit_start_repositioning"
+        ),
         "urdf_path": args.urdf_path,
+        "trajectory_json": args.trajectory_json,
+        "validation_trajectory_json": args.validation_trajectory_json,
+        "validation_required": bool(args.require_validation),
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -1153,14 +1350,6 @@ def main() -> int:
     collision_checker = None
     if args.execute:
         follow_client.wait_for_server(args.action_server_timeout)
-        if not args.no_collision_check:
-            collision_checker = MoveItStateValidityChecker(
-                telemetry,
-                args.collision_check_service,
-                args.group,
-                args.joints,
-            )
-            collision_checker.wait_for_service(args.action_server_timeout)
         if not args.skip_moveit_start:
             moveit = MoveItActionClient(
                 telemetry,
@@ -1177,6 +1366,14 @@ def main() -> int:
                 acceleration_scale=min(args.max_joint_acceleration, 0.25),
             )
             moveit.wait_for_servers(args.action_server_timeout)
+    if (args.execute or args.preflight_only) and not args.no_collision_check:
+        collision_checker = MoveItStateValidityChecker(
+            telemetry,
+            args.collision_check_service,
+            args.group,
+            args.joints,
+        )
+        collision_checker.wait_for_service(args.action_server_timeout)
 
     if collision_checker is not None:
         logger.info(
@@ -1194,6 +1391,13 @@ def main() -> int:
             total_checked += checked
             logger.info(f"Collision check passed for {phase.name}: {checked} sampled states")
         logger.info(f"Collision preflight passed for all direct phases: {total_checked} sampled states")
+
+    if args.preflight_only:
+        logger.info("Collision preflight complete; no trajectory was executed and no bag was recorded")
+        executor.shutdown()
+        telemetry.destroy_node()
+        rclpy.shutdown()
+        return 0
 
     recorder = None
     if args.execute and not args.no_record_bag:

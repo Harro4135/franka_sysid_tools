@@ -19,13 +19,13 @@ One-command driver: [`scripts/stage2_capture_session.sh`](scripts/stage2_capture
 - [ ] Fixed-base Panda URDF available and matching the 7 controlled joints (`URDF=...`).
 - [ ] `franka_robot_state_broadcaster` running (tau_J source).
 - [ ] Raise the bringup `/joint_states` publish rate as high as the stack allows; verify with `ros2 topic hz`.
-- [ ] Offline plan solved and previews inspected (`offline_plan/torque_preview.png` — effort scale must sit inside Franka limits with margin).
+- [ ] Independent train and validation plans solved and both previews inspected (`offline_plans/{train,validation}/torque_preview.png` — effort scale must sit inside Franka limits with margin).
 
 ## Session order
 
 1. Dry-run (script default): plan validation + collision preflight, no motion.
 2. Optional: replay `trajectory.json` in MoveIt fake hardware or MuJoCo (`franka_sysid_sim_mujoco.py`) if this is the first execution of a new plan.
-3. `--execute`: v3 D-optimal suite, then v2 friction sweeps + static holds.
+3. `--execute`: v3 D-optimal training plus a separately seeded validation trajectory, then v2 friction sweeps + static holds.
 4. QC on the spot: `ros2 bag info` durations match manifests; effort channel non-empty; no controller aborts in `phase_events.jsonl`.
 
 ## Safety
@@ -38,6 +38,6 @@ One-command driver: [`scripts/stage2_capture_session.sh`](scripts/stage2_capture
 
 - [ ] Import each bag with its topic map; confirm `torque_semantics: link_side`.
 - [ ] Telemetry-quality report: common-mode lag -> `telemetry.command_delay_seconds`; per-joint residual spread noted (actuator latency, do not fold in).
-- [ ] Solve joint families (gains + friction) on v3 train phases, validate on `d_optimal_validation`.
+- [ ] Solve joint families (gains + friction) only on `d_optimal_train`; validate on `d_optimal_validation`, which is marked `excluded_from_fit` in the manifest and events.
 - [ ] Solve mass/CoM by load-side regression on static holds; cross-check against the rollout solve's mass.
 - [ ] Run the sim-sim harness against the new spec before trusting the solve (`tools/headless_sysid_simsim.py`) — recovering known truth is the only loud failure mode.

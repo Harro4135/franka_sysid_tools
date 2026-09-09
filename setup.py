@@ -25,6 +25,7 @@ setup(
             "franka_sysid_collect_v2 = franka_sysid_tools.franka_sysid_collect_v2:main",
             "franka_sysid_collect_v3 = franka_sysid_tools.franka_sysid_collect_v3:main",
             "franka_sysid_optimize_v3_offline = franka_sysid_tools.franka_sysid_optimize_v3_offline:main",
+            "franka_sysid_optimize_stiffness_offline = franka_sysid_tools.franka_sysid_optimize_stiffness_offline:main",
             "franka_sysid_sim_mujoco = franka_sysid_tools.franka_sysid_sim_mujoco:main",
             "so101_sysid_collect_v2 = franka_sysid_tools.so101_sysid_collect_v2:main",
         ],

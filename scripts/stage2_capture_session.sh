@@ -44,6 +44,10 @@ if ! ros2 topic list 2>/dev/null | grep -q "^$ROBOT_STATE_TOPIC$"; then
   echo "      Start the franka_robot_state_broadcaster or Stage-2 mass/CoM goals are compromised."
   [ "$EXECUTE" = "1" ] && exit 2
 fi
+if ! ros2 run franka_sysid_tools franka_sysid_collect_v3 --help 2>&1 \
+     | grep -q -- "--validation-trajectory-json"; then
+  echo "FATAL: installed franka_sysid_collect_v3 is stale; rebuild and source the workspace"; exit 2
+fi
 
 # timeout(1) exits 124 when it kills `ros2 topic hz`; neutralize it before the
 # pipe so pipefail doesn't both fail the parse and append the `|| echo 0`
@@ -64,21 +68,40 @@ if rate < target:
 EOF
 
 # --------------------------- offline D-optimal plan --------------------------
-PLAN="$OUTROOT/offline_plan"
-if [ ! -f "$PLAN/trajectory.json" ]; then
-  echo "== Solving offline D-optimal plan (CasADi/IPOPT + Pinocchio)"
+PLAN_ROOT="$OUTROOT/offline_plans"
+TRAIN_PLAN="$PLAN_ROOT/train"
+VALIDATION_PLAN="$PLAN_ROOT/validation"
+if [ ! -f "$TRAIN_PLAN/trajectory.json" ] || [ ! -f "$TRAIN_PLAN/manifest.json" ]; then
+  echo "== Solving offline D-optimal training plan (CasADi/IPOPT + Pinocchio)"
   python3 -m franka_sysid_tools.franka_sysid_optimize_v3_offline \
     --urdf-path "$URDF" \
-    --output-dir "$PLAN"
-  echo "   Inspect $PLAN/torque_preview.png and positions/velocities plots before executing."
+    --output-dir "$TRAIN_PLAN" \
+    --ipopt-max-iter 500
 else
-  echo "== Reusing existing offline plan: $PLAN/trajectory.json"
+  echo "== Reusing existing training plan: $TRAIN_PLAN/trajectory.json"
 fi
+if [ ! -f "$VALIDATION_PLAN/trajectory.json" ] || [ ! -f "$VALIDATION_PLAN/manifest.json" ]; then
+  echo "== Solving independent offline D-optimal validation plan"
+  python3 -m franka_sysid_tools.franka_sysid_optimize_v3_offline \
+    --urdf-path "$URDF" \
+    --output-dir "$VALIDATION_PLAN" \
+    --base-period 6.8 \
+    --cycles 2 \
+    --amplitude-scale 0.595 \
+    --seed 20260813 \
+    --ipopt-max-iter 500
+else
+  echo "== Reusing existing validation plan: $VALIDATION_PLAN/trajectory.json"
+fi
+echo "   Inspect both plans' torque_preview.png and position/velocity plots before executing."
 
 # ------------------------------- dry runs -----------------------------------
-echo "== v3 dry-run (plan validation, no motion)"
+echo "== v3 collision preflight for train + validation (no motion)"
 ros2 run franka_sysid_tools franka_sysid_collect_v3 \
-  --trajectory-json "$PLAN/trajectory.json" \
+  --preflight-only \
+  --require-validation \
+  --trajectory-json "$TRAIN_PLAN/trajectory.json" \
+  --validation-trajectory-json "$VALIDATION_PLAN/trajectory.json" \
   --urdf-path "$URDF" \
   --follow-action "$FOLLOW_ACTION" \
   --torque-source franka-robot-state \
@@ -95,16 +118,20 @@ fi
 read -r -p "Robot clear, cell safe, E-stop in hand. Execute Stage-2 suite? [yes/NO] " CONFIRM
 [ "$CONFIRM" = "yes" ] || { echo "aborted"; exit 1; }
 
-echo "== Capture 1/2: v3 D-optimal suite (warmup, train, fast, static holds, validation)"
+echo "== Capture 1/2: v3 D-optimal training + independently optimized validation"
 ros2 run franka_sysid_tools franka_sysid_collect_v3 \
   --execute \
-  --trajectory-json "$PLAN/trajectory.json" \
+  --require-validation \
+  --trajectory-json "$TRAIN_PLAN/trajectory.json" \
+  --validation-trajectory-json "$VALIDATION_PLAN/trajectory.json" \
   --urdf-path "$URDF" \
   --follow-action "$FOLLOW_ACTION" \
   --torque-source franka-robot-state \
   --robot-state-topic "$ROBOT_STATE_TOPIC" \
   --include-effort \
   --output-dir "$OUTROOT/v3_d_optimal"
+
+python3 "$(dirname "$0")/verify_v3_holdout.py" "$OUTROOT/v3_d_optimal"
 
 echo "== Capture 2/2: v2 friction sweeps + static holds (per-joint velocity ladder)"
 ros2 run franka_sysid_tools franka_sysid_collect_v2 \

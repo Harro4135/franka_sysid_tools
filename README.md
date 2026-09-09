@@ -164,6 +164,85 @@ The v3 suite is split into:
 
 The manifest records the URDF path, base-regressor rank settings, Fourier harmonics, IPOPT settings, ridge/condition penalty, and per-phase D-optimal scores. The URDF must be a fixed-base Panda model matching the seven controlled arm joints.
 
+For a higher-energy v3-only hardware demo with an independently optimized
+validation trajectory, use
+[`scripts/franka_v3_high_energy_capture.sh`](scripts/franka_v3_high_energy_capture.sh).
+Its default envelope raises v3 to amplitude scale 0.90, 0.85 rad/s, and
+1.75 rad/s² (the existing v2 velocity/acceleration envelope), commands at
+100 Hz, and checks collision states every two samples. Without `--execute` it
+only optimizes both plans and runs the no-motion collision preflight. The
+hardware run still requires an explicit `--execute` and interactive `yes`.
+
+```bash
+URDF=/path/to/panda_fixed_base.urdf \
+  bash scripts/franka_v3_high_energy_capture.sh
+
+URDF=/path/to/panda_fixed_base.urdf \
+  bash scripts/franka_v3_high_energy_capture.sh --execute
+```
+
+The train and validation plans use different seeds, periods, amplitudes, and
+durations. The collector records them as `d_optimal_train` (`split: train`) and
+`d_optimal_validation` (`split: validation`). Validation events carry
+`excluded_from_fit: true`; MoveIt repositioning, inter-phase holds, and other
+unassigned samples sit outside both phase intervals and are excluded as well.
+After capture, the script runs `verify_v3_holdout.py` and writes
+`holdout_report.json` beside the bag.
+
+## Stiffness-Only Optimized Capture
+
+When drive stiffness is the only fitted parameter, use the stiffness-specific
+designer instead of the physical inertial/friction regressor NLP. It optimizes
+the position command against the closed-loop sensitivity
+`d q / d log(stiffness)`, averaged over an uncertain natural-frequency band.
+It is NumPy-only: there is no URDF, Pinocchio callback, CasADi graph, finite
+difference gradient, or IPOPT solve.
+
+The complete workflow runs directly on the sourced ROS machine. The default
+invocation creates independent training and validation plans, then performs a
+no-motion MoveIt collision preflight:
+
+```bash
+bash scripts/franka_stiffness_capture.sh
+```
+
+After inspecting the generated plots, explicitly enable hardware motion:
+
+```bash
+bash scripts/franka_stiffness_capture.sh --execute
+```
+
+The captured phase names are `stiffness_train` and `stiffness_validation`.
+Only the former has `fit_eligible: true`; validation has
+`excluded_from_fit: true`, and transitions/repositioning remain outside both
+phase intervals. `verify_v3_holdout.py` checks this after the run. Link-side
+torque is recorded when the Franka robot-state topic is available, but it is
+diagnostic and is not required by the stiffness-only position-domain fit.
+
+The defaults robustly average natural frequencies from 0.4 to 2.0 Hz at
+damping ratio 0.7. Override these if the nominal fixed mass/damping model gives
+a better closed-loop bandwidth estimate:
+
+```bash
+NATURAL_FREQUENCY_MIN_HZ=0.8 \
+NATURAL_FREQUENCY_MAX_HZ=3.0 \
+DAMPING_RATIO=0.8 \
+  bash scripts/franka_stiffness_capture.sh
+```
+
+For plan generation alone, including on a non-ROS machine:
+
+```bash
+python -m franka_sysid_tools.franka_sysid_optimize_stiffness_offline \
+  --output-dir ~/sysid_runs/stiffness_plan \
+  --base-period 6.0 \
+  --cycles 5 \
+  --amplitude-scale 0.90
+```
+
+This command optimizes the excitation trajectory; the actual stiffness-value
+fit still happens downstream from measured reference/feedback position data.
+
 ## Offline V3 Solve And Sim Replay
 
 You can solve the physical-regressor D-optimal trajectory on a non-ROS machine with only Python, NumPy, CasADi, Pinocchio, and Matplotlib:
@@ -199,12 +278,20 @@ The plots and `torque_preview` are a Pinocchio inverse-dynamics preview, useful 
 ```bash
 ros2 run franka_sysid_tools franka_sysid_collect_v3 \
   --execute \
-  --trajectory-json ~/sysid_runs/franka_v3_offline_plan/trajectory.json \
+  --require-validation \
+  --trajectory-json ~/sysid_runs/franka_v3_offline_train/trajectory.json \
+  --validation-trajectory-json ~/sysid_runs/franka_v3_offline_validation/trajectory.json \
   --follow-action /panda_arm_controller/follow_joint_trajectory \
   --output-dir ~/sysid_runs/franka_v3_fake_hw_replay
 ```
 
-When `--trajectory-json` is supplied, the ROS collector skips CasADi/Pinocchio optimization and uses the sampled offline trajectory directly. Collision preflight, MoveIt start repositioning, telemetry publishing, and bag recording still run through the normal v3 execution path.
+When `--trajectory-json` is supplied, the ROS collector skips CasADi/Pinocchio
+optimization and uses the sampled offline trajectory directly. Supplying a
+second, numerically distinct plan through `--validation-trajectory-json` makes
+it a held-out validation phase. `--require-validation` prevents an accidental
+single-training-phase replay like the earlier v3 runs. Collision preflight,
+MoveIt start repositioning, telemetry publishing, and bag recording still run
+through the normal v3 execution path.
 
 You can also replay the same offline trajectory in MuJoCo without ROS:
 
@@ -289,7 +376,10 @@ V3 D-optimality knobs:
 
 ```bash
 --urdf-path /path/to/panda_fixed_base.urdf
---trajectory-json ~/sysid_runs/franka_v3_offline_plan/trajectory.json
+--trajectory-json ~/sysid_runs/franka_v3_offline_train/trajectory.json
+--validation-trajectory-json ~/sysid_runs/franka_v3_offline_validation/trajectory.json
+--require-validation
+--preflight-only
 --base-regressor-samples 240
 --base-regressor-rank-tolerance 1e-8
 --fourier-harmonics 5
