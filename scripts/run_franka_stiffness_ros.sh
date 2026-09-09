@@ -53,7 +53,11 @@ if [ ! -f "$ROS_WS/install/setup.bash" ]; then
   exit 2
 fi
 # shellcheck disable=SC1091
+# Colcon setup files may probe optional variables such as COLCON_TRACE.
+# Temporarily disable nounset while loading the generated environment.
+set +u
 source "$ROS_WS/install/setup.bash"
+set -u
 
 SESSION="${SESSION:-franka_stiffness_$(date +%Y%m%d_%H%M%S)}"
 OUTROOT="${OUTROOT:-$HOME/sysid_runs/$SESSION}"
