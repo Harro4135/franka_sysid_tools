@@ -13,6 +13,7 @@ JOINT_STATES_TOPIC="${JOINT_STATES_TOPIC:-/joint_states}"
 ROBOT_STATE_TOPIC="${ROBOT_STATE_TOPIC:-/franka_robot_state_broadcaster/robot_state}"
 
 SAMPLE_RATE_HZ="${SAMPLE_RATE_HZ:-100}"
+SETTLE_SEC="${SETTLE_SEC:-0}"
 MAX_VELOCITY_RAD_S="${MAX_VELOCITY_RAD_S:-0.85}"
 MAX_ACCELERATION_RAD_S2="${MAX_ACCELERATION_RAD_S2:-1.75}"
 NATURAL_FREQUENCY_MIN_HZ="${NATURAL_FREQUENCY_MIN_HZ:-0.4}"
@@ -44,6 +45,7 @@ echo "== Franka stiffness-specific session: $SESSION"
 echo "   output: $OUTROOT"
 echo "   design: position-domain log-stiffness sensitivity (no URDF/Pinocchio/CasADi/IPOPT)"
 echo "   envelope: amplitude=$TRAIN_AMPLITUDE_SCALE, velocity=$MAX_VELOCITY_RAD_S rad/s, acceleration=$MAX_ACCELERATION_RAD_S2 rad/s^2"
+echo "   reference settle: $SETTLE_SEC s"
 
 if ! ros2 action list 2>/dev/null | grep -q "$FOLLOW_ACTION"; then
   echo "FATAL: FollowJointTrajectory action '$FOLLOW_ACTION' not found"; exit 2
@@ -114,6 +116,7 @@ ros2 run franka_sysid_tools franka_sysid_collect_v3 \
   --follow-action "$FOLLOW_ACTION" \
   "${TORQUE_ARGS[@]}" \
   --sample-rate "$SAMPLE_RATE_HZ" \
+  --settle-sec "$SETTLE_SEC" \
   --max-joint-velocity "$MAX_VELOCITY_RAD_S" \
   --max-joint-acceleration "$MAX_ACCELERATION_RAD_S2" \
   --collision-check-stride 2 \
@@ -141,6 +144,7 @@ ros2 run franka_sysid_tools franka_sysid_collect_v3 \
   --follow-action "$FOLLOW_ACTION" \
   "${TORQUE_ARGS[@]}" \
   --sample-rate "$SAMPLE_RATE_HZ" \
+  --settle-sec "$SETTLE_SEC" \
   --max-joint-velocity "$MAX_VELOCITY_RAD_S" \
   --max-joint-acceleration "$MAX_ACCELERATION_RAD_S2" \
   --collision-check-stride 2 \
