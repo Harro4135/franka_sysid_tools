@@ -17,6 +17,7 @@ def test_production_defaults_use_boosted_motion_envelope():
     np.testing.assert_allclose(FRANKA_AMPLITUDES, [0.40, 0.28, 0.38, 0.25, 0.38, 0.25, 0.38])
     args = build_argument_parser().parse_args(["--output-dir", "unused"])
     assert args.max_joint_acceleration == 2.0
+    assert args.nonrepeating is False
 
 
 def _config(**overrides):
@@ -73,6 +74,28 @@ def test_designed_trajectory_is_reproducible_feasible_and_stops_at_cycle_boundar
     boundary_indices = np.arange(config.cycles + 1) * samples_per_cycle
     assert np.max(np.abs(dq[boundary_indices])) < 1e-10
     assert np.max(np.abs(ddq[boundary_indices])) < 1e-10
+
+
+def test_nonrepeating_design_uses_one_full_duration_period_without_internal_stops():
+    config = _config(base_period=4.0, cycles=3, sample_rate=40.0, repeat_cycles=False)
+    result = design_trajectory(config)
+
+    q = np.asarray(result["positions"])
+    dq = np.asarray(result["velocities"])
+    ddq = np.asarray(result["accelerations"])
+    samples_per_nominal_cycle = int(config.base_period * config.sample_rate)
+    internal_boundaries = np.arange(1, config.cycles) * samples_per_nominal_cycle
+
+    np.testing.assert_array_equal(result["harmonic_indices"], [3.0, 7.0, 8.0, 13.0, 15.0])
+    assert result["spectral_period_sec"] == config.base_period * config.cycles
+    assert not np.allclose(
+        q[:samples_per_nominal_cycle],
+        q[samples_per_nominal_cycle : 2 * samples_per_nominal_cycle],
+    )
+    assert np.max(np.abs(dq[internal_boundaries])) > 1e-3
+    assert np.max(np.abs(ddq[internal_boundaries])) > 1e-3
+    assert np.max(np.abs(dq[[0, -1]])) < 1e-10
+    assert np.max(np.abs(ddq[[0, -1]])) < 1e-10
 
 
 def test_more_candidates_never_reduce_first_joint_information():

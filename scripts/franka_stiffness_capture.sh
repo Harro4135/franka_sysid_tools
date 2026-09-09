@@ -35,7 +35,7 @@ TARGET_RATE_HZ="${TARGET_RATE_HZ:-100}"
 EXECUTE=0
 [ "${1:-}" = "--execute" ] && EXECUTE=1
 
-PLAN_ROOT="$OUTROOT/offline_stiffness_plans_v1"
+PLAN_ROOT="$OUTROOT/offline_stiffness_plans_v2_nonrepeating"
 TRAIN_PLAN="$PLAN_ROOT/train"
 VALIDATION_PLAN="$PLAN_ROOT/validation"
 CAPTURE="$OUTROOT/capture"
@@ -43,7 +43,7 @@ mkdir -p "$OUTROOT"
 
 echo "== Franka stiffness-specific session: $SESSION"
 echo "   output: $OUTROOT"
-echo "   design: position-domain log-stiffness sensitivity (no URDF/Pinocchio/CasADi/IPOPT)"
+echo "   design: one nonrepeating full-duration position-domain stiffness trajectory"
 echo "   envelope: amplitude=$TRAIN_AMPLITUDE_SCALE, velocity=$MAX_VELOCITY_RAD_S rad/s, acceleration=$MAX_ACCELERATION_RAD_S2 rad/s^2"
 echo "   reference settle: $SETTLE_SEC s"
 
@@ -55,8 +55,8 @@ if ! ros2 run franka_sysid_tools franka_sysid_collect_v3 --help 2>&1 \
   echo "FATAL: installed franka_sysid_collect_v3 is stale; rebuild and source the workspace"; exit 2
 fi
 if ! ros2 run franka_sysid_tools franka_sysid_optimize_stiffness_offline --help 2>&1 \
-     | grep -q -- "--natural-frequency-min-hz"; then
-  echo "FATAL: stiffness optimizer is not installed; rebuild and source the workspace"; exit 2
+     | grep -q -- "--nonrepeating"; then
+  echo "FATAL: nonrepeating stiffness optimizer is not installed; rebuild and source the workspace"; exit 2
 fi
 
 RATE=$( { timeout 15 ros2 topic hz --window 200 "$JOINT_STATES_TOPIC" 2>/dev/null || true; } \
@@ -71,6 +71,7 @@ if [ ! -f "$TRAIN_PLAN/_SUCCESS" ] || [ ! -f "$TRAIN_PLAN/trajectory.json" ]; th
     --sample-rate "$SAMPLE_RATE_HZ" \
     --base-period "$TRAIN_BASE_PERIOD_SEC" \
     --cycles "$TRAIN_CYCLES" \
+    --nonrepeating \
     --amplitude-scale "$TRAIN_AMPLITUDE_SCALE" \
     --seed "$TRAIN_SEED" \
     --candidates "$DESIGN_CANDIDATES" \
@@ -88,6 +89,7 @@ if [ ! -f "$VALIDATION_PLAN/_SUCCESS" ] || [ ! -f "$VALIDATION_PLAN/trajectory.j
     --sample-rate "$SAMPLE_RATE_HZ" \
     --base-period "$VALIDATION_BASE_PERIOD_SEC" \
     --cycles "$VALIDATION_CYCLES" \
+    --nonrepeating \
     --amplitude-scale "$VALIDATION_AMPLITUDE_SCALE" \
     --seed "$VALIDATION_SEED" \
     --candidates "$DESIGN_CANDIDATES" \

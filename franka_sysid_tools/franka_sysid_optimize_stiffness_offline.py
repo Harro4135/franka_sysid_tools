@@ -73,6 +73,7 @@ class DesignConfig:
     seed: int
     correlation_penalty: float
     damping_target: str
+    repeat_cycles: bool = True
 
 
 @dataclass
@@ -137,8 +138,39 @@ def stiffness_sensitivity_gain_squared(
     return np.abs(derivative) ** 2
 
 
-def robust_harmonic_gains(config: DesignConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    harmonic_frequencies = np.arange(1, config.harmonic_count + 1, dtype=np.float64) / config.base_period
+def _harmonic_layout(config: DesignConfig) -> tuple[np.ndarray, float]:
+    """Return integer Fourier bins and the period over which they are defined."""
+
+    if config.repeat_cycles or config.cycles == 1:
+        return np.arange(1, config.harmonic_count + 1, dtype=np.float64), config.base_period
+
+    # Preserve the original frequency neighborhood, but move interior bins off
+    # exact multiples of ``cycles``.  Their gcd is one, so the combined command
+    # has one full-duration period instead of repeating every base period.
+    indices = config.cycles * np.arange(1, config.harmonic_count + 1, dtype=np.int64)
+    if config.cycles == 2:
+        indices[1::2] += 1
+    elif config.harmonic_count == 2:
+        indices[1] += 1
+    else:
+        for index in range(1, config.harmonic_count - 1):
+            indices[index] += 1 if index % 2 else -1
+
+    if np.any(np.diff(indices) <= 0):
+        raise RuntimeError(f"could not construct increasing nonrepeating Fourier bins: {indices.tolist()}")
+    common_divisor = 0
+    for index in indices:
+        common_divisor = math.gcd(common_divisor, int(index))
+    if common_divisor != 1:
+        raise RuntimeError(f"nonrepeating Fourier bins have gcd {common_divisor}: {indices.tolist()}")
+    return indices.astype(np.float64), config.base_period * config.cycles
+
+
+def robust_harmonic_gains(
+    config: DesignConfig,
+) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+    harmonic_indices, spectral_period = _harmonic_layout(config)
+    harmonic_frequencies = harmonic_indices / spectral_period
     natural_frequencies = np.geomspace(
         config.natural_frequency_min_hz,
         config.natural_frequency_max_hz,
@@ -153,7 +185,7 @@ def robust_harmonic_gains(config: DesignConfig) -> tuple[np.ndarray, np.ndarray,
     # A geometric mean is deliberately less resonance-dominated than an
     # arithmetic mean and rewards excitation useful across the whole band.
     robust_gain = np.exp(np.mean(np.log(gain_grid + 1e-18), axis=1))
-    return harmonic_frequencies, natural_frequencies, robust_gain
+    return harmonic_indices, spectral_period, harmonic_frequencies, natural_frequencies, robust_gain
 
 
 def evaluate_fourier(
@@ -163,6 +195,7 @@ def evaluate_fourier(
     cos_coefficients: np.ndarray,
     *,
     base_period: float,
+    harmonic_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate position Fourier coefficients and their first 3 derivatives."""
 
@@ -175,7 +208,12 @@ def evaluate_fourier(
     if sin_coefficients.shape[0] != len(centers):
         raise ValueError("coefficient joint count differs from center count")
 
-    harmonics = np.arange(1, sin_coefficients.shape[1] + 1, dtype=np.float64)
+    if harmonic_indices is None:
+        harmonics = np.arange(1, sin_coefficients.shape[1] + 1, dtype=np.float64)
+    else:
+        harmonics = np.asarray(harmonic_indices, dtype=np.float64).reshape(-1)
+        if harmonics.shape != (sin_coefficients.shape[1],):
+            raise ValueError("harmonic index count differs from coefficient count")
     omega_h = (2.0 * math.pi / float(base_period)) * harmonics
     phase = times[:, np.newaxis] * omega_h[np.newaxis, :]
     sin_phase = np.sin(phase)
@@ -232,10 +270,12 @@ def _design_joint(
     robust_gain: np.ndarray,
     constraint_times: np.ndarray,
     previous_waves: list[np.ndarray],
+    harmonic_indices: np.ndarray,
+    spectral_period: float,
 ) -> JointDesign:
     harmonic_count = config.harmonic_count
-    harmonics = np.arange(1, harmonic_count + 1, dtype=np.float64)
-    omega_h = (2.0 * math.pi / config.base_period) * harmonics
+    harmonics = np.asarray(harmonic_indices, dtype=np.float64)
+    omega_h = (2.0 * math.pi / spectral_period) * harmonics
     phase = constraint_times[:, np.newaxis] * omega_h[np.newaxis, :]
     sin_basis = np.sin(phase)
     cos_basis = np.cos(phase)
@@ -324,9 +364,11 @@ def design_trajectory(config: DesignConfig) -> dict[str, object]:
     """Design all seven joint commands and return sampled arrays plus metrics."""
 
     _validate_config(config)
-    harmonic_frequencies, natural_frequencies, robust_gain = robust_harmonic_gains(config)
-    constraint_count = max(1001, int(math.ceil(config.base_period * config.constraint_rate)) + 1)
-    constraint_times = np.linspace(0.0, config.base_period, constraint_count)
+    harmonic_indices, spectral_period, harmonic_frequencies, natural_frequencies, robust_gain = (
+        robust_harmonic_gains(config)
+    )
+    constraint_count = max(1001, int(math.ceil(spectral_period * config.constraint_rate)) + 1)
+    constraint_times = np.linspace(0.0, spectral_period, constraint_count)
 
     joint_designs: list[JointDesign] = []
     previous_waves: list[np.ndarray] = []
@@ -337,6 +379,8 @@ def design_trajectory(config: DesignConfig) -> dict[str, object]:
             robust_gain,
             constraint_times,
             previous_waves,
+            harmonic_indices,
+            spectral_period,
         )
         joint_designs.append(design)
         previous_waves.append(design.command_wave)
@@ -351,7 +395,8 @@ def design_trajectory(config: DesignConfig) -> dict[str, object]:
         FRANKA_CENTER,
         sin_coefficients,
         cos_coefficients,
-        base_period=config.base_period,
+        base_period=spectral_period,
+        harmonic_indices=harmonic_indices,
     )
 
     dense_q, dense_dq, dense_ddq, dense_jerk = evaluate_fourier(
@@ -359,7 +404,8 @@ def design_trajectory(config: DesignConfig) -> dict[str, object]:
         FRANKA_CENTER,
         sin_coefficients,
         cos_coefficients,
-        base_period=config.base_period,
+        base_period=spectral_period,
+        harmonic_indices=harmonic_indices,
     )
     _verify_constraints(config, dense_q, dense_dq, dense_ddq, dense_jerk)
 
@@ -373,6 +419,8 @@ def design_trajectory(config: DesignConfig) -> dict[str, object]:
         "jerks": jerk,
         "sin_coefficients": sin_coefficients,
         "cos_coefficients": cos_coefficients,
+        "harmonic_indices": harmonic_indices,
+        "spectral_period_sec": spectral_period,
         "harmonic_frequencies_hz": harmonic_frequencies,
         "natural_frequency_samples_hz": natural_frequencies,
         "robust_gain_squared": robust_gain,
@@ -514,6 +562,9 @@ def write_outputs(output_dir: Path, config: DesignConfig, result: dict[str, obje
         "sample_rate_hz": config.sample_rate,
         "base_period_sec": config.base_period,
         "cycles": config.cycles,
+        "repeat_cycles": config.repeat_cycles,
+        "spectral_period_sec": float(result["spectral_period_sec"]),
+        "harmonic_indices": np.asarray(result["harmonic_indices"]).astype(int).tolist(),
         "points": [
             {
                 "time": float(times[index]),
@@ -538,6 +589,8 @@ def write_outputs(output_dir: Path, config: DesignConfig, result: dict[str, obje
             jerks=np.asarray(result["jerks"]),
             sin_coefficients=np.asarray(result["sin_coefficients"]),
             cos_coefficients=np.asarray(result["cos_coefficients"]),
+            harmonic_indices=np.asarray(result["harmonic_indices"]),
+            spectral_period_sec=np.asarray(float(result["spectral_period_sec"])),
             joint_names=np.asarray(FRANKA_JOINTS),
         )
     os.replace(npz_temporary, output_dir / "trajectory.npz")
@@ -556,6 +609,9 @@ def write_outputs(output_dir: Path, config: DesignConfig, result: dict[str, obje
             "identified_parameter": "per-joint drive stiffness K",
             "derivative_parameterization": "log(K), holding M and D fixed",
             "damping_target": config.damping_target,
+            "repeat_cycles": config.repeat_cycles,
+            "spectral_period_sec": float(result["spectral_period_sec"]),
+            "harmonic_indices": np.asarray(result["harmonic_indices"]).astype(int).tolist(),
             "natural_frequency_samples_hz": np.asarray(result["natural_frequency_samples_hz"]).tolist(),
             "harmonic_frequencies_hz": np.asarray(result["harmonic_frequencies_hz"]).tolist(),
             "robust_gain_squared": np.asarray(result["robust_gain_squared"]).tolist(),
@@ -601,6 +657,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-period", type=float, default=6.0)
     parser.add_argument("--cycles", type=int, default=5)
     parser.add_argument("--harmonics", type=int, default=5)
+    parser.add_argument(
+        "--nonrepeating",
+        action="store_true",
+        help=(
+            "Use one full-duration Fourier realization with no repeated base-period cycles; "
+            "zero velocity and acceleration are enforced only at the overall endpoints."
+        ),
+    )
     parser.add_argument("--sample-rate", type=float, default=100.0)
     parser.add_argument("--constraint-rate", type=float, default=500.0)
     parser.add_argument("--amplitude-scale", type=float, default=0.90)
@@ -647,6 +711,7 @@ def config_from_args(args: argparse.Namespace) -> DesignConfig:
         seed=int(args.seed),
         correlation_penalty=float(args.correlation_penalty),
         damping_target=str(args.damping_target),
+        repeat_cycles=not bool(args.nonrepeating),
     )
 
 
